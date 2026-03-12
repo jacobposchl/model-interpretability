@@ -1,10 +1,12 @@
 """
 Depth-weighted circuit consistency loss.
 
-ℒ_cons(x₁, x₂) = Σ_l  w_l · D(h_l(x₁), h_l(x₂))
+ℒ_cons(x₁, x₂) = Σ_l  w_l · (1 - cos(h_l(x₁), h_l(x₂)))
 
 Applied to pairs of same-category inputs. Penalises divergence between their
 per-layer circuit representations, with the penalty growing with layer depth.
+Uses cosine distance, which is dimension-independent and ranges [0, 1] per
+sample regardless of activation dimensionality.
 
 Depth weighting rationale:
   Early layers extract surface features (edges, textures) that legitimately
@@ -17,11 +19,6 @@ Depth weighting rationale:
     'linear'      — w_l = l / Σl         (gradual ramp)
     'exponential' — w_l = exp(l) / Σexp  (sharp late-layer emphasis)
     'uniform'     — w_l = 1/L            (ablation baseline, Stage 4)
-
-Distance options:
-    'l2'      — MSE on L2-normalised vectors. Simple and stable.
-    'cosine'  — 1 - cosine_similarity. Equivalent to L2 on unit sphere
-                but ignores magnitude differences.
 """
 
 import torch
@@ -42,11 +39,9 @@ def _depth_weights(num_layers: int, scheme: str, device: torch.device) -> torch.
 
 
 class CircuitConsistencyLoss(nn.Module):
-    def __init__(self, weight_scheme: str = "linear", distance: str = "l2"):
+    def __init__(self, weight_scheme: str = "linear"):
         super().__init__()
         self.weight_scheme = weight_scheme
-        self.distance = distance
-        # Cached weight tensor — recomputed if num_layers changes
         self._cached_weights: torch.Tensor | None = None
         self._cached_L: int = 0
 
@@ -78,12 +73,7 @@ class CircuitConsistencyLoss(nn.Module):
 
         loss = torch.zeros(1, device=traj1[0].device)
         for h1, h2, w in zip(traj1, traj2, weights):
-            if self.distance == "l2":
-                d = F.mse_loss(F.normalize(h1, dim=-1), F.normalize(h2, dim=-1))
-            elif self.distance == "cosine":
-                d = (1.0 - F.cosine_similarity(h1, h2, dim=-1)).mean()
-            else:
-                raise ValueError(f"Unknown distance: '{self.distance}'. Use l2/cosine.")
+            d = (1.0 - F.cosine_similarity(h1, h2, dim=-1)).mean()
             loss = loss + w * d
 
         return loss.squeeze()

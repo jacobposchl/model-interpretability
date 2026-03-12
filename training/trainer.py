@@ -119,7 +119,6 @@ class Trainer:
         ccfg = self.cfg["training"].get("consistency_loss", {})
         self.consistency_loss = CircuitConsistencyLoss(
             weight_scheme=ccfg.get("weight_scheme", "linear"),
-            distance=ccfg.get("distance", "l2"),
         )
         self.contrastive_loss = NTXentLoss(temperature=0.07)
 

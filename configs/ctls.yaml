@@ -44,7 +44,6 @@ training:
 
   consistency_loss:
     weight_scheme: linear  # depth-weighted: later layers penalised more
-    distance: l2
     gradient_checkpointing: false
 
 logging:

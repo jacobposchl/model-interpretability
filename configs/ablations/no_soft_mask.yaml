@@ -46,7 +46,6 @@ training:
 
   consistency_loss:
     weight_scheme: linear
-    distance: l2
     gradient_checkpointing: false
 
 logging:

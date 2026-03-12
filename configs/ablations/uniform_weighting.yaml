@@ -45,7 +45,6 @@ training:
 
   consistency_loss:
     weight_scheme: uniform   # <-- ablation: all layers weighted equally
-    distance: l2
     gradient_checkpointing: false
 
 logging:
