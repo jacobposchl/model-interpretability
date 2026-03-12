@@ -102,16 +102,17 @@ class Trainer:
 
     def _build_optimizers(self):
         tcfg = self.cfg["training"]
+        lr = float(tcfg.get("lr", 1e-3))
         params = list(self.backbone.parameters()) + list(self.meta_encoder.parameters())
         self.optimizer = AdamW(
             params,
-            lr=tcfg.get("lr", 1e-3),
-            weight_decay=tcfg.get("weight_decay", 1e-4),
+            lr=lr,
+            weight_decay=float(tcfg.get("weight_decay", 1e-4)),
         )
         self.lr_scheduler = CosineAnnealingLR(
             self.optimizer,
             T_max=tcfg["epochs"],
-            eta_min=tcfg.get("lr", 1e-3) * 0.01,
+            eta_min=lr * 0.01,
         )
 
     def _build_losses(self):
