@@ -1,0 +1,53 @@
+# Stage 2 — Full CTLS objective.
+# Trains with the depth-weighted circuit consistency loss in addition to
+# the standard cross-entropy task loss. Lambda is warmed up gradually to
+# avoid disrupting backbone representations before they stabilise.
+
+experiment:
+  name: ctls_cifar10
+  stage: 2
+
+model:
+  arch: resnet18
+  num_classes: 10
+  pretrained: false
+  meta_encoder:
+    hidden_dim: 256
+    embedding_dim: 64
+    encoder_type: mlp
+  soft_mask:
+    init_temperature: 1.0   # fluid weighting at start of training
+
+data:
+  dataset: cifar10
+  data_dir: ./data/raw
+  batch_size: 128
+  num_workers: 4
+  augment: true
+
+training:
+  paired: true             # PairedCIFAR10 — each batch contains (x1, x2, label)
+  epochs: 100
+  optimizer: adamw
+  lr: 1e-3
+  weight_decay: 1e-4
+
+  lambda_consistency:
+    init: 0.0              # start with no consistency pressure
+    final: 1.0             # ramp to full weight
+    warmup_epochs: 10      # over first 10 epochs
+
+  temperature:
+    init: 1.0              # start with soft, fluid masking
+    final: 0.1             # anneal to near-binary circuits
+    anneal_epochs: 80      # over most of training
+
+  consistency_loss:
+    weight_scheme: linear  # depth-weighted: later layers penalised more
+    distance: l2
+    gradient_checkpointing: false
+
+logging:
+  checkpoint_dir: ./experiments/ctls
+  log_interval: 50
+  save_every: 10

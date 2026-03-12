@@ -1,0 +1,54 @@
+# Stage 4 ablation — uniform depth weighting.
+# Identical to ctls.yaml except weight_scheme is 'uniform' (w_l = 1/L for all l).
+# Compare against the depth-weighted run to validate that late-layer emphasis
+# matters. If results are similar, the weighting claim in the paper is weak.
+# If depth-weighted is clearly better, it validates a key design decision.
+
+experiment:
+  name: ctls_uniform_weights_cifar10
+  stage: 4
+
+model:
+  arch: resnet18
+  num_classes: 10
+  pretrained: false
+  meta_encoder:
+    hidden_dim: 256
+    embedding_dim: 64
+    encoder_type: mlp
+  soft_mask:
+    init_temperature: 1.0
+
+data:
+  dataset: cifar10
+  data_dir: ./data/raw
+  batch_size: 128
+  num_workers: 4
+  augment: true
+
+training:
+  paired: true
+  epochs: 100
+  optimizer: adamw
+  lr: 1e-3
+  weight_decay: 1e-4
+
+  lambda_consistency:
+    init: 0.0
+    final: 1.0
+    warmup_epochs: 10
+
+  temperature:
+    init: 1.0
+    final: 0.1
+    anneal_epochs: 80
+
+  consistency_loss:
+    weight_scheme: uniform   # <-- ablation: all layers weighted equally
+    distance: l2
+    gradient_checkpointing: false
+
+logging:
+  checkpoint_dir: ./experiments/ablations/uniform_weighting
+  log_interval: 50
+  save_every: 10
