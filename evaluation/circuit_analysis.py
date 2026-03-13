@@ -133,25 +133,32 @@ class CircuitAnalyzer:
         target_z:   torch.Tensor,
         n_steps:    int   = 512,
         lr:         float = 0.05,
-        tv_weight:  float = 0.05,
-        l2_weight:  float = 1e-3,
-        blur_every: int   = 4,
+        tv_weight:  float = 1.0,
+        l2_weight:  float = 0.05,
+        blur_every: int   = 2,
+        init_from:  torch.Tensor = None,
         verbose:    bool  = False,
     ) -> torch.Tensor:
         """
         Optimise input pixels to minimise cosine distance to target_z.
 
-        Gradient flows through the frozen backbone and meta-encoder back to
-        the input image. TV and L2 regularisation suppress adversarial noise;
-        periodic Gaussian blur further enforces spatial smoothness.
+        For CIFAR-scale networks the cosine gradient at the pixel level is tiny
+        (~1e-4), so random-noise init converges to adversarial noise regardless
+        of regularisation strength.  Passing init_from (e.g. the class mean
+        image in normalised space) anchors the optimisation near real-image
+        structure; TV + blur then keep it smooth while the cosine loss refines
+        toward the target.
 
         Args:
             target_z:   [D] target circuit embedding (should be L2-normalised)
             n_steps:    optimisation steps
             lr:         Adam learning rate
-            tv_weight:  total variation regularisation weight (dominant regulariser)
-            l2_weight:  L2 image norm regularisation weight
+            tv_weight:  total variation weight — dominant spatial regulariser
+            l2_weight:  L2 image-norm weight
             blur_every: apply 3×3 Gaussian blur every N steps (0 = disabled)
+            init_from:  [3, 32, 32] starting image in CIFAR normalised space.
+                        Pass the class mean image for coherent results.
+                        Defaults to small random noise when None.
             verbose:    print loss every 100 steps
 
         Returns:
@@ -160,7 +167,10 @@ class CircuitAnalyzer:
         self.backbone.eval()
         self.meta_encoder.eval()
 
-        x = torch.randn(1, 3, 32, 32, device=self.device) * 0.1
+        if init_from is not None:
+            x = init_from.clone().detach().unsqueeze(0).to(self.device)
+        else:
+            x = torch.randn(1, 3, 32, 32, device=self.device) * 0.1
         x.requires_grad_(True)
 
         optimizer = torch.optim.Adam([x], lr=lr)
