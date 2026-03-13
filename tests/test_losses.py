@@ -10,7 +10,7 @@ import torch
 import pytest
 
 from losses.consistency import CircuitConsistencyLoss, _depth_weights
-from losses.contrastive import NTXentLoss
+from losses.contrastive import SupConLoss
 
 
 # --------------------------------------------------------------------------- #
@@ -54,7 +54,7 @@ class TestCircuitConsistencyLoss:
         return [torch.randn(B, d) for d in dims]
 
     def test_identical_trajectories_zero_loss(self):
-        loss_fn = CircuitConsistencyLoss(weight_scheme="linear", distance="l2")
+        loss_fn = CircuitConsistencyLoss(weight_scheme="linear")
         traj = self._make_traj()
         loss = loss_fn(traj, traj)
         assert loss.item() < 1e-5
@@ -72,11 +72,12 @@ class TestCircuitConsistencyLoss:
         loss = loss_fn(t1, t2)
         assert loss.shape == torch.Size([])
 
-    def test_cosine_distance(self):
-        loss_fn = CircuitConsistencyLoss(distance="cosine")
+    def test_loss_bounded(self):
+        # Cosine distance is in [0, 1], so weighted sum is in [0, 1]
+        loss_fn = CircuitConsistencyLoss()
         t1, t2 = self._make_traj(), self._make_traj()
         loss = loss_fn(t1, t2)
-        assert loss.item() >= 0
+        assert 0.0 <= loss.item() <= 1.0
 
     def test_mismatched_lengths_raises(self):
         loss_fn = CircuitConsistencyLoss()
@@ -104,36 +105,41 @@ class TestCircuitConsistencyLoss:
 
 
 # --------------------------------------------------------------------------- #
-# NTXentLoss
+# SupConLoss
 # --------------------------------------------------------------------------- #
 
-class TestNTXentLoss:
+class TestSupConLoss:
     def test_output_is_scalar(self):
-        loss_fn = NTXentLoss(temperature=0.07)
-        z1 = torch.randn(8, 64)
-        z2 = torch.randn(8, 64)
-        loss = loss_fn(z1, z2)
+        loss_fn = SupConLoss(temperature=0.07)
+        z = torch.randn(16, 64)
+        labels = torch.randint(0, 10, (16,))
+        loss = loss_fn(z, labels)
         assert loss.shape == torch.Size([])
 
     def test_positive_loss(self):
-        loss_fn = NTXentLoss()
-        z1 = torch.randn(8, 64)
-        z2 = torch.randn(8, 64)
-        assert loss_fn(z1, z2).item() > 0
-
-    def test_identical_pairs_lower_than_random(self):
-        # When z1==z2 (perfect alignment), loss should be lower than for random pairs
-        loss_fn = NTXentLoss(temperature=0.07)
+        loss_fn = SupConLoss()
         z = torch.randn(16, 64)
-        loss_identical = loss_fn(z, z.clone())
-        loss_random = loss_fn(z, torch.randn(16, 64))
-        assert loss_identical.item() < loss_random.item()
+        labels = torch.randint(0, 10, (16,))
+        assert loss_fn(z, labels).item() > 0
+
+    def test_same_class_lower_loss_than_all_different(self):
+        # Embeddings that are already aligned by class should have lower loss
+        # than completely random embeddings with scattered labels
+        loss_fn = SupConLoss(temperature=0.07)
+        # Clustered: each class has tight embeddings
+        z_clustered = torch.zeros(20, 64)
+        labels = torch.arange(10).repeat(2)  # 10 classes × 2 samples
+        for c in range(10):
+            mask = labels == c
+            z_clustered[mask] = torch.randn(64) + c * 5.0  # well-separated
+        loss_clustered = loss_fn(z_clustered, labels)
+        loss_random = loss_fn(torch.randn(20, 64), labels)
+        assert loss_clustered.item() < loss_random.item()
 
     def test_backprop(self):
-        loss_fn = NTXentLoss()
-        z1 = torch.randn(8, 64, requires_grad=True)
-        z2 = torch.randn(8, 64, requires_grad=True)
-        loss = loss_fn(z1, z2)
+        loss_fn = SupConLoss()
+        z = torch.randn(16, 64, requires_grad=True)
+        labels = torch.randint(0, 10, (16,))
+        loss = loss_fn(z, labels)
         loss.backward()
-        assert z1.grad is not None
-        assert z2.grad is not None
+        assert z.grad is not None

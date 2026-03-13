@@ -62,9 +62,12 @@ class Trainer:
         cfg = self.cfg
         mcfg = cfg["model"]
 
+        # SoftMask must stay on CPU until after CTLSBackbone.__init__ completes,
+        # because _discover_dims runs a CPU dummy forward pass. The backbone
+        # registers soft_mask as a submodule, so .to(device) below moves both.
         self.soft_mask = SoftMask(
             init_temperature=cfg["training"]["temperature"]["init"]
-        ).to(self.device)
+        )
 
         self.backbone = CTLSBackbone(
             arch=mcfg["arch"],

@@ -107,7 +107,7 @@ class CTLSBackbone(nn.Module):
     def _discover_dims(self, arch: str) -> list[int]:
         """Run a tiny dummy forward pass to learn trajectory tensor shapes."""
         # CIFAR-10 uses 32×32 inputs
-        dummy_size = (1, 3, 32, 32) if "cifar" in arch or True else (1, 3, 224, 224)
+        dummy_size = (1, 3, 32, 32)
         dummy = torch.zeros(dummy_size)
         with torch.no_grad():
             _, traj = self.forward(dummy)
