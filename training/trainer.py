@@ -9,12 +9,15 @@ Training flow for CTLS (paired mode):
   1. Load paired batch (x1, x2, labels) from PairedCIFAR10.
   2. Concatenate [x1, x2] along batch dim → single forward pass → split
      trajectory and logits back out. One forward pass = full efficiency.
-  3. Task loss:  cross_entropy(logits1, labels) + cross_entropy(logits2, labels)
-  4. Consistency loss: ℒ_cons(traj1, traj2)
-  5. Total loss: ℒ_task + λ * ℒ_cons
-  6. Update λ (linear warmup) and τ (cosine annealing) each epoch.
+  3. Task loss:      cross_entropy(logits1, labels) + cross_entropy(logits2, labels)
+  4. Consistency:    ℒ_cons(traj1, traj2)   — depth-weighted per-layer cosine distance
+  5. SupCon:         ℒ_supcon(z_all, labels) — supervised contrastive on circuit embeddings;
+                     attracts same-class embeddings, repels different-class embeddings,
+                     preventing degenerate trajectory collapse.
+  6. Total loss: ℒ_task + λ * ℒ_cons + μ * ℒ_supcon
+  7. Update λ (linear warmup) and τ (cosine annealing) each epoch.
 
-For baseline mode (paired=False), x2 and the consistency loss are ignored.
+For baseline mode (paired=False), x2 and both auxiliary losses are ignored.
 """
 
 import os
@@ -32,7 +35,7 @@ from models.soft_mask import SoftMask
 from models.backbone import CTLSBackbone
 from models.meta_encoder import MetaEncoder
 from losses.consistency import CircuitConsistencyLoss
-from losses.contrastive import NTXentLoss
+from losses.contrastive import SupConLoss
 from data.cifar import get_paired_loaders, get_standard_loaders
 from training.schedulers import LambdaScheduler, TauScheduler
 
@@ -116,11 +119,15 @@ class Trainer:
         )
 
     def _build_losses(self):
-        ccfg = self.cfg["training"].get("consistency_loss", {})
+        tcfg = self.cfg["training"]
+        ccfg = tcfg.get("consistency_loss", {})
         self.consistency_loss = CircuitConsistencyLoss(
             weight_scheme=ccfg.get("weight_scheme", "linear"),
         )
-        self.contrastive_loss = NTXentLoss(temperature=0.07)
+        self.supcon_loss = SupConLoss(
+            temperature=float(tcfg.get("supcon_temperature", 0.07)),
+        )
+        self.lambda_supcon = float(tcfg.get("lambda_supcon", 0.1))
 
     def _build_schedulers(self):
         tcfg = self.cfg["training"]
@@ -171,7 +178,8 @@ class Trainer:
                 f"Epoch {epoch+1:3d}/{epochs} | "
                 f"loss={train_metrics['loss']:.4f} "
                 f"task={train_metrics['task_loss']:.4f} "
-                f"cons={train_metrics['cons_loss']:.4f} | "
+                f"cons={train_metrics['cons_loss']:.4f} "
+                f"supcon={train_metrics['supcon_loss']:.4f} | "
                 f"val_acc={val_metrics['acc']:.3f} | "
                 f"λ={self.lambda_val:.3f} τ={tau:.3f}"
             )
@@ -192,6 +200,7 @@ class Trainer:
         total_loss = 0.0
         total_task = 0.0
         total_cons = 0.0
+        total_supcon = 0.0
         n_batches = 0
 
         for batch_idx, batch in enumerate(self.train_loader):
@@ -219,7 +228,16 @@ class Trainer:
                 ) / 2.0
 
                 cons_loss = self.consistency_loss(traj1, traj2)
-                loss = task_loss + self.lambda_val * cons_loss
+
+                # Supervised contrastive loss on circuit embeddings.
+                # Concatenate embeddings and labels from both views → [2B, D] / [2B].
+                z1 = self.meta_encoder(traj1)
+                z2 = self.meta_encoder(traj2)
+                z_all = torch.cat([z1, z2], dim=0)
+                labels_all = torch.cat([labels, labels], dim=0)
+                supcon_loss = self.supcon_loss(z_all, labels_all)
+
+                loss = task_loss + self.lambda_val * cons_loss + self.lambda_supcon * supcon_loss
 
             else:
                 x, labels = batch
@@ -229,6 +247,7 @@ class Trainer:
                 logits, traj = self.backbone(x)
                 task_loss = F.cross_entropy(logits, labels)
                 cons_loss = torch.zeros(1, device=self.device)
+                supcon_loss = torch.zeros(1, device=self.device)
                 loss = task_loss
 
             loss.backward()
@@ -241,6 +260,7 @@ class Trainer:
             total_loss += loss.item()
             total_task += task_loss.item()
             total_cons += cons_loss.item()
+            total_supcon += supcon_loss.item()
             n_batches += 1
 
             if (batch_idx + 1) % log_interval == 0:
@@ -248,13 +268,15 @@ class Trainer:
                     f"  [{batch_idx+1}/{len(self.train_loader)}] "
                     f"loss={loss.item():.4f} "
                     f"task={task_loss.item():.4f} "
-                    f"cons={cons_loss.item():.4f}"
+                    f"cons={cons_loss.item():.4f} "
+                    f"supcon={supcon_loss.item():.4f}"
                 )
 
         return {
             "loss": total_loss / n_batches,
             "task_loss": total_task / n_batches,
             "cons_loss": total_cons / n_batches,
+            "supcon_loss": total_supcon / n_batches,
         }
 
     @torch.no_grad()

@@ -44,6 +44,9 @@ training:
     final: 0.01              # no annealing — held constant
     anneal_epochs: 100
 
+  lambda_supcon: 0.1
+  supcon_temperature: 0.07
+
   consistency_loss:
     weight_scheme: linear
     gradient_checkpointing: false

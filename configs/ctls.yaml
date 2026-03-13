@@ -42,6 +42,9 @@ training:
     final: 0.1             # anneal to near-binary circuits
     anneal_epochs: 80      # over most of training
 
+  lambda_supcon: 0.1         # weight for supervised contrastive loss on circuit embeddings
+  supcon_temperature: 0.07   # temperature for SupCon loss
+
   consistency_loss:
     weight_scheme: linear  # depth-weighted: later layers penalised more
     gradient_checkpointing: false

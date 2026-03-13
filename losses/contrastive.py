@@ -1,13 +1,21 @@
 """
-NT-Xent (Normalized Temperature-scaled Cross-Entropy) contrastive loss.
+Supervised Contrastive Loss (SupCon) for circuit embeddings.
 
-Used in Stage 1 to train the meta-encoder in isolation, before the full
-CTLS consistency loss is introduced. This lets the meta-encoder learn a
-meaningful circuit latent space using a standard SimCLR-style objective,
-establishing a baseline for how much semantic structure exists in the circuit
-space of a normally-trained model.
+Operates on the meta-encoder output z ∈ R^D for a batch of 2B samples
+(B from x1, B from x2). Uses ground-truth class labels to define positives
+and negatives, preventing the degenerate collapse that a purely attractive
+consistency loss causes.
 
-Reference: Chen et al. "A Simple Framework for Contrastive Learning" (2020).
+For each anchor i:
+  Positives P(i) — all j ≠ i with the same class label
+  Negatives      — all j ≠ i with a different class label (implicit via denominator)
+
+  L_i = -1/|P(i)| Σ_{p ∈ P(i)} log [ exp(z_i · z_p / τ) / Σ_{j ≠ i} exp(z_i · z_j / τ) ]
+
+With a batch of 2B = 256 samples across 10 classes, each anchor has ~25 positives
+and ~230 negatives, giving a strong separation signal.
+
+Reference: Khosla et al. "Supervised Contrastive Learning" (NeurIPS 2020).
 """
 
 import torch
@@ -15,40 +23,44 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-class NTXentLoss(nn.Module):
+class SupConLoss(nn.Module):
     def __init__(self, temperature: float = 0.07):
         super().__init__()
         self.temperature = temperature
 
-    def forward(self, z1: torch.Tensor, z2: torch.Tensor) -> torch.Tensor:
+    def forward(self, z: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            z1: circuit embeddings for first view, shape [B, D]
-            z2: circuit embeddings for second view, shape [B, D]
+            z:      circuit embeddings, shape [N, D] (need not be pre-normalised)
+            labels: class labels, shape [N]
 
         Returns:
-            Scalar NT-Xent loss.
+            Scalar supervised contrastive loss.
         """
-        B = z1.shape[0]
+        N = z.shape[0]
+        z = F.normalize(z, dim=-1)
 
-        # Normalize
-        z1 = F.normalize(z1, dim=-1)
-        z2 = F.normalize(z2, dim=-1)
-
-        # Concatenate: [2B, D]
-        z = torch.cat([z1, z2], dim=0)
-
-        # Similarity matrix: [2B, 2B]
+        # Pairwise cosine similarity scaled by temperature: [N, N]
         sim = torch.mm(z, z.t()) / self.temperature
 
-        # Mask out self-similarities
-        mask = torch.eye(2 * B, device=z.device, dtype=torch.bool)
-        sim = sim.masked_fill(mask, float('-inf'))
+        diag_mask = torch.eye(N, device=z.device, dtype=torch.bool)
 
-        # Positive pairs: (i, i+B) and (i+B, i)
-        labels = torch.cat([
-            torch.arange(B, 2 * B, device=z.device),
-            torch.arange(0, B, device=z.device),
-        ])
+        # Positive mask: same label, excluding self
+        pos_mask = (labels.unsqueeze(1) == labels.unsqueeze(0)) & ~diag_mask  # [N, N]
 
-        return F.cross_entropy(sim, labels)
+        # Numerically stable softmax: subtract row-wise max
+        sim = sim - sim.detach().max(dim=1, keepdim=True).values
+
+        # Denominator: sum exp(sim) over all j ≠ i
+        exp_sim = torch.exp(sim).masked_fill(diag_mask, 0.0)
+        log_denom = torch.log(exp_sim.sum(dim=1, keepdim=True) + 1e-8)  # [N, 1]
+
+        # Log-probability for every (anchor, candidate) pair
+        log_prob = sim - log_denom  # [N, N]
+
+        # Average log-prob over positives; skip anchors with no positives
+        n_pos = pos_mask.sum(dim=1).float()  # [N]
+        valid = n_pos > 0
+        pos_log_prob_sum = (pos_mask.float() * log_prob).sum(dim=1)  # [N]
+        loss = -(pos_log_prob_sum[valid] / n_pos[valid]).mean()
+        return loss
