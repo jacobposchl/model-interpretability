@@ -1,19 +1,34 @@
 """
 Circuit analysis utilities for Stage 6 — Circuit Analysis.
 
-Two experiments:
-  1. Activation Maximization — optimise input pixels to minimise cosine
-     distance to a target point in circuit space ("circuit dreams").
-  2. KNN Retrieval — k-nearest neighbours in circuit space vs output space,
-     revealing where the model's internal representations and final predictions
-     diverge.
+Two experiments, both using only the frozen CTLS checkpoint:
+
+  1. Circuit Nearest Neighbors — for any target point in circuit space
+     (class centroid, interpolation step, confusion-zone point), retrieve
+     the real images whose circuit embeddings are closest.  No synthesis
+     required; the model selects its own most-representative examples.
+
+  2. Circuit vs Output Neighbors + GradCAM — for boundary images, compare
+     the k nearest neighbours in circuit space vs output (softmax) space.
+     GradCAM on the last spatial feature map shows which spatial regions
+     drive the circuit similarity to a target class, even though the
+     trajectory itself is globally pooled (per-channel gradient weights
+     applied to the spatial map still vary across channels and positions).
+
+Note on activation maximization:
+  The backbone hook computes `tensor.mean(dim=[2,3])` (global average pool)
+  before storing each trajectory step.  This makes d(traj)/d(x[h,w])
+  spatially uniform — every pixel gets the same gradient direction, so
+  pixel-optimisation converges to uniform gray regardless of regularisation.
+  Nearest-neighbor retrieval and GradCAM avoid this limitation entirely.
 
 Usage:
     from evaluation.circuit_analysis import CircuitAnalyzer, denormalize, CIFAR10_CLASSES
     analyzer = CircuitAnalyzer(backbone, meta_encoder, val_loader, device)
     z, logits, x, labels = analyzer.collect_all()
     centroids = analyzer.class_centroids(z, labels)
-    dream = analyzer.activate_maximize(centroids[3])  # cat centroid dream
+    _, imgs, lbls, sims = analyzer.nearest_to_target(centroids[3], z, x, labels)
+    cam = analyzer.gradcam(x[i], centroids[5])
 """
 
 import torch
@@ -42,14 +57,6 @@ def denormalize(x: torch.Tensor) -> torch.Tensor:
     return (x * std + mean).clamp(0, 1)
 
 
-def _total_variation(x: torch.Tensor) -> torch.Tensor:
-    """Isotropic total variation regularizer for [B, C, H, W] tensors."""
-    return (
-        (x[:, :, 1:, :] - x[:, :, :-1, :]).abs().mean() +
-        (x[:, :, :, 1:] - x[:, :, :, :-1]).abs().mean()
-    )
-
-
 class CircuitAnalyzer:
     def __init__(
         self,
@@ -73,10 +80,10 @@ class CircuitAnalyzer:
         Collect circuit embeddings, output probabilities, images, and labels.
 
         Returns:
-            z:      [N, D]          L2-normalised circuit embeddings (CPU)
-            logits: [N, num_classes] softmax probabilities (CPU)
-            x:      [N, 3, 32, 32]  normalised images (CPU)
-            labels: [N]             integer class labels (CPU)
+            z:      [N, D]           L2-normalised circuit embeddings (CPU)
+            logits: [N, num_classes]  softmax probabilities (CPU)
+            x:      [N, 3, 32, 32]   normalised images (CPU)
+            labels: [N]              integer class labels (CPU)
         """
         self.backbone.eval()
         self.meta_encoder.eval()
@@ -125,88 +132,29 @@ class CircuitAnalyzer:
         return centroids
 
     # ------------------------------------------------------------------ #
-    # Activation maximization
+    # Nearest-neighbour retrieval
     # ------------------------------------------------------------------ #
 
-    def activate_maximize(
+    def nearest_to_target(
         self,
         target_z:   torch.Tensor,
-        n_steps:    int   = 512,
-        lr:         float = 0.05,
-        tv_weight:  float = 1.0,
-        l2_weight:  float = 0.05,
-        blur_every: int   = 2,
-        init_from:  torch.Tensor = None,
-        verbose:    bool  = False,
-    ) -> torch.Tensor:
+        z_all:      torch.Tensor,
+        x_all:      torch.Tensor,
+        labels_all: torch.Tensor,
+        k:          int = 5,
+    ) -> tuple:
         """
-        Optimise input pixels to minimise cosine distance to target_z.
-
-        For CIFAR-scale networks the cosine gradient at the pixel level is tiny
-        (~1e-4), so random-noise init converges to adversarial noise regardless
-        of regularisation strength.  Passing init_from (e.g. the class mean
-        image in normalised space) anchors the optimisation near real-image
-        structure; TV + blur then keep it smooth while the cosine loss refines
-        toward the target.
-
-        Args:
-            target_z:   [D] target circuit embedding (should be L2-normalised)
-            n_steps:    optimisation steps
-            lr:         Adam learning rate
-            tv_weight:  total variation weight — dominant spatial regulariser
-            l2_weight:  L2 image-norm weight
-            blur_every: apply 3×3 Gaussian blur every N steps (0 = disabled)
-            init_from:  [3, 32, 32] starting image in CIFAR normalised space.
-                        Pass the class mean image for coherent results.
-                        Defaults to small random noise when None.
-            verbose:    print loss every 100 steps
+        k real images from the corpus closest (cosine) to an arbitrary target
+        in circuit space.  Unlike knn_circuit, target_z need not be in the
+        corpus — use this for centroids, interpolation points, etc.
 
         Returns:
-            [3, 32, 32] denormalised image in [0, 1] (CPU)
+            (indices [k], images [k, C, H, W], labels [k], cosine_sims [k])
         """
-        self.backbone.eval()
-        self.meta_encoder.eval()
-
-        if init_from is not None:
-            x = init_from.clone().detach().unsqueeze(0).to(self.device)
-        else:
-            x = torch.randn(1, 3, 32, 32, device=self.device) * 0.1
-        x.requires_grad_(True)
-
-        optimizer = torch.optim.Adam([x], lr=lr)
-        target    = F.normalize(target_z.to(self.device), dim=-1).unsqueeze(0)
-
-        # 3×3 Gaussian blur kernel — built once, reused every blur_every steps
-        _gk = torch.tensor([[1, 2, 1], [2, 4, 2], [1, 2, 1]],
-                            dtype=torch.float32, device=self.device) / 16.0
-        _gk = _gk.view(1, 1, 3, 3).expand(3, 1, 3, 3)
-
-        for step in range(n_steps):
-            optimizer.zero_grad()
-
-            _, traj = self.backbone(x)
-            z = self.meta_encoder(traj)
-
-            cos_loss = (1 - F.cosine_similarity(z, target)).mean()
-            reg_loss = tv_weight * _total_variation(x) + l2_weight * (x ** 2).mean()
-            (cos_loss + reg_loss).backward()
-            optimizer.step()
-
-            # Periodic Gaussian blur enforces spatial smoothness beyond TV alone
-            if blur_every > 0 and (step + 1) % blur_every == 0:
-                with torch.no_grad():
-                    x.data.copy_(F.conv2d(x.data, _gk, padding=1, groups=3))
-
-            if verbose and (step + 1) % 100 == 0:
-                print(f"    step {step+1:4d}: cos={cos_loss.item():.4f}  "
-                      f"reg={reg_loss.item():.5f}")
-
-        with torch.no_grad():
-            return denormalize(x.squeeze(0).detach()).cpu()
-
-    # ------------------------------------------------------------------ #
-    # k-nearest neighbour retrieval
-    # ------------------------------------------------------------------ #
+        target = F.normalize(target_z.cpu(), dim=-1)
+        sims   = z_all @ target
+        topk   = sims.topk(k).indices
+        return topk, x_all[topk], labels_all[topk], sims[topk]
 
     def knn_circuit(
         self,
@@ -214,20 +162,16 @@ class CircuitAnalyzer:
         all_z:   torch.Tensor,
         all_x:   torch.Tensor,
         k:       int = 5,
-    ):
+    ) -> tuple:
         """
-        k-nearest neighbours of query_z in circuit space (cosine similarity).
-
-        Args:
-            query_z: [D]          single L2-normalised query embedding
-            all_z:   [N, D]       corpus of L2-normalised embeddings
-            all_x:   [N, 3, H, W] corresponding images
+        k-nearest neighbours of an in-corpus query in circuit space.
+        Excludes exact self-match.
 
         Returns:
             (indices [k], images [k, 3, H, W], cosine_distances [k])
         """
         sims = all_z @ F.normalize(query_z, dim=-1)
-        sims[(sims - 1.0).abs() < 1e-5] = -2.0   # exclude self
+        sims[(sims - 1.0).abs() < 1e-5] = -2.0
         topk = sims.topk(k).indices
         return topk, all_x[topk], 1 - sims[topk]
 
@@ -237,18 +181,10 @@ class CircuitAnalyzer:
         all_logits:   torch.Tensor,
         all_x:        torch.Tensor,
         k:            int = 5,
-    ):
+    ) -> tuple:
         """
         k-nearest neighbours in output (softmax probability) space.
-
-        Cosine similarity on softmax distributions: two images are 'close' if
-        the model is similarly uncertain between the same classes, not just if
-        they share the same top-1 prediction.
-
-        Args:
-            query_logits: [C]    softmax probabilities for the query
-            all_logits:   [N, C] corpus softmax probabilities
-            all_x:        [N, 3, H, W] corresponding images
+        Cosine similarity on softmax distributions.
 
         Returns:
             (indices [k], images [k, 3, H, W], cosine_distances [k])
@@ -256,6 +192,85 @@ class CircuitAnalyzer:
         q      = F.normalize(query_logits, dim=-1)
         corpus = F.normalize(all_logits,   dim=-1)
         sims   = corpus @ q
-        sims[(sims - 1.0).abs() < 1e-5] = -2.0   # exclude self
+        sims[(sims - 1.0).abs() < 1e-5] = -2.0
         topk   = sims.topk(k).indices
         return topk, all_x[topk], 1 - sims[topk]
+
+    # ------------------------------------------------------------------ #
+    # GradCAM on circuit similarity
+    # ------------------------------------------------------------------ #
+
+    def gradcam(
+        self,
+        x_img:    torch.Tensor,
+        target_z: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        GradCAM of cosine similarity to target_z w.r.t. the last spatial
+        feature map in the backbone.
+
+        Although the backbone trajectory is globally average-pooled, the
+        gradient of the loss w.r.t. the PRE-POOL spatial feature map still
+        varies per channel (alpha_c differs because each channel contributes
+        differently to the pooled trajectory → z → cosine similarity).
+        Weighting the spatial map by alpha_c and summing over channels
+        reveals where those channels are most active — i.e., which spatial
+        regions are most circuit-relevant for the target class.
+
+        This is standard Grad-CAM applied to the last ResNet block before
+        the global-average-pool in the trajectory hook.
+
+        Args:
+            x_img:    [3, 32, 32] normalised input image
+            target_z: [D] target circuit embedding (L2-normalised)
+
+        Returns:
+            [32, 32] heatmap in [0, 1] (CPU)
+        """
+        # Leaf tensor with grad so the spatial feature map enters the graph
+        x      = x_img.detach().unsqueeze(0).to(self.device).requires_grad_(True)
+        target = F.normalize(target_z.to(self.device), dim=-1).unsqueeze(0)
+
+        saved = {}
+
+        def _fwd(module, inp, out):
+            t = out[0] if isinstance(out, (tuple, list)) else out
+            saved['feat'] = t
+            # Hook fires during backward with d(loss)/d(t)
+            t.register_hook(lambda g: saved.__setitem__('grad', g))
+
+        hook = self.backbone._hook_modules[-1].register_forward_hook(_fwd)
+        try:
+            self.backbone.eval()
+            self.meta_encoder.eval()
+
+            _, traj = self.backbone(x)
+            z       = self.meta_encoder(traj)
+            F.cosine_similarity(z, target).mean().backward()
+
+            feat = saved.get('feat')
+            grad = saved.get('grad')
+
+            if feat is None or grad is None or feat.dim() != 4:
+                # ViT or unexpected shape — return a neutral uniform map
+                return torch.ones(32, 32) * 0.5
+
+            # alpha_c = mean gradient per channel  [1, C, 1, 1]
+            weights = grad.mean(dim=[2, 3], keepdim=True)
+            # Weighted sum over channels, ReLU to keep positive contributions
+            cam = F.relu((weights * feat).sum(dim=1).squeeze(0))  # [H, W]
+            # Upsample to input resolution
+            cam = F.interpolate(
+                cam.unsqueeze(0).unsqueeze(0),
+                size=(32, 32),
+                mode='bilinear',
+                align_corners=False,
+            ).squeeze()
+            mn, mx = cam.min(), cam.max()
+            if mx > mn:
+                cam = (cam - mn) / (mx - mn)
+            return cam.detach().cpu()
+        finally:
+            hook.remove()
+            self.backbone.zero_grad()
+            self.meta_encoder.zero_grad()
