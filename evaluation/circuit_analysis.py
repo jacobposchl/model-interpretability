@@ -130,26 +130,29 @@ class CircuitAnalyzer:
 
     def activate_maximize(
         self,
-        target_z:  torch.Tensor,
-        n_steps:   int   = 500,
-        lr:        float = 0.01,
-        tv_weight: float = 1e-4,
-        l2_weight: float = 1e-5,
-        verbose:   bool  = False,
+        target_z:   torch.Tensor,
+        n_steps:    int   = 512,
+        lr:         float = 0.05,
+        tv_weight:  float = 0.05,
+        l2_weight:  float = 1e-3,
+        blur_every: int   = 4,
+        verbose:    bool  = False,
     ) -> torch.Tensor:
         """
         Optimise input pixels to minimise cosine distance to target_z.
 
         Gradient flows through the frozen backbone and meta-encoder back to
-        the input image. TV and L2 regularisation suppress adversarial noise.
+        the input image. TV and L2 regularisation suppress adversarial noise;
+        periodic Gaussian blur further enforces spatial smoothness.
 
         Args:
-            target_z:  [D] target circuit embedding (should be L2-normalised)
-            n_steps:   optimisation steps
-            lr:        Adam learning rate
-            tv_weight: total variation regularisation weight
-            l2_weight: L2 image norm regularisation weight
-            verbose:   print loss every 100 steps
+            target_z:   [D] target circuit embedding (should be L2-normalised)
+            n_steps:    optimisation steps
+            lr:         Adam learning rate
+            tv_weight:  total variation regularisation weight (dominant regulariser)
+            l2_weight:  L2 image norm regularisation weight
+            blur_every: apply 3×3 Gaussian blur every N steps (0 = disabled)
+            verbose:    print loss every 100 steps
 
         Returns:
             [3, 32, 32] denormalised image in [0, 1] (CPU)
@@ -161,7 +164,12 @@ class CircuitAnalyzer:
         x.requires_grad_(True)
 
         optimizer = torch.optim.Adam([x], lr=lr)
-        target    = F.normalize(target_z.to(self.device), dim=-1).unsqueeze(0)  # [1, D]
+        target    = F.normalize(target_z.to(self.device), dim=-1).unsqueeze(0)
+
+        # 3×3 Gaussian blur kernel — built once, reused every blur_every steps
+        _gk = torch.tensor([[1, 2, 1], [2, 4, 2], [1, 2, 1]],
+                            dtype=torch.float32, device=self.device) / 16.0
+        _gk = _gk.view(1, 1, 3, 3).expand(3, 1, 3, 3)
 
         for step in range(n_steps):
             optimizer.zero_grad()
@@ -171,10 +179,13 @@ class CircuitAnalyzer:
 
             cos_loss = (1 - F.cosine_similarity(z, target)).mean()
             reg_loss = tv_weight * _total_variation(x) + l2_weight * (x ** 2).mean()
-            loss     = cos_loss + reg_loss
-
-            loss.backward()
+            (cos_loss + reg_loss).backward()
             optimizer.step()
+
+            # Periodic Gaussian blur enforces spatial smoothness beyond TV alone
+            if blur_every > 0 and (step + 1) % blur_every == 0:
+                with torch.no_grad():
+                    x.data.copy_(F.conv2d(x.data, _gk, padding=1, groups=3))
 
             if verbose and (step + 1) % 100 == 0:
                 print(f"    step {step+1:4d}: cos={cos_loss.item():.4f}  "
