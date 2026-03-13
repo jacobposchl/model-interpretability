@@ -1,0 +1,53 @@
+# Stage 6 — Circuit Decoder (post-hoc).
+#
+# The backbone and meta-encoder are frozen from the CTLS checkpoint.
+# Only the CircuitDecoder weights are trained.
+#
+# Two decoders are trained sequentially in train_decoder.py:
+#   - decoder_ctls:     trained on CTLS circuit embeddings
+#   - decoder_baseline: trained on baseline circuit embeddings (for comparison)
+#
+# Usage:
+#   python scripts/train_decoder.py --config configs/decoder.yaml
+
+experiment:
+  name: circuit_decoder
+  stage: 6
+
+model:
+  arch: resnet18
+  num_classes: 10
+  pretrained: false
+  meta_encoder:
+    hidden_dim: 256
+    embedding_dim: 64
+    encoder_type: mlp
+  soft_mask:
+    # Use the final CTLS temperature (not saved in checkpoint since
+    # SoftMask.temperature is not a buffer). Must match the annealed value.
+    init_temperature: 0.1
+
+decoder:
+  embedding_dim: 64
+  hidden_channels: [256, 128, 64, 32]
+  input_spatial: 4          # initial spatial dim; upsampled 4→8→16→32
+
+data:
+  dataset: cifar10
+  data_dir: ./data/raw
+  batch_size: 256
+  num_workers: 4
+  augment: true             # augment train set so decoder sees varied views
+
+training:
+  ctls_checkpoint: ./experiments/ctls/best.pt
+  baseline_checkpoint: ./experiments/baseline/best.pt
+  epochs: 50
+  optimizer: adamw
+  lr: 1e-3
+  weight_decay: 1e-4
+
+logging:
+  checkpoint_dir: ./experiments/decoder
+  log_interval: 50
+  save_every: 10
