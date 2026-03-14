@@ -1,34 +1,39 @@
 """
-Circuit analysis utilities for Stage 6 — Circuit Analysis.
+Circuit analysis utilities for Stage 6 (circuit visualization) and
+Stage 7 (trajectory divergence analysis).
 
-Two experiments, both using only the frozen CTLS checkpoint:
+Stage 6 — two experiments using the frozen CTLS checkpoint:
+  1. Circuit Nearest Neighbors — retrieve real images closest to any target
+     point in circuit space (centroid, interpolation step, confusion zone).
+  2. Circuit vs Output Neighbors + GradCAM — compare k-NN in circuit space
+     vs softmax-probability space; GradCAM localises which spatial regions
+     drive the circuit similarity to a target class.
 
-  1. Circuit Nearest Neighbors — for any target point in circuit space
-     (class centroid, interpolation step, confusion-zone point), retrieve
-     the real images whose circuit embeddings are closest.  No synthesis
-     required; the model selects its own most-representative examples.
-
-  2. Circuit vs Output Neighbors + GradCAM — for boundary images, compare
-     the k nearest neighbours in circuit space vs output (softmax) space.
-     GradCAM on the last spatial feature map shows which spatial regions
-     drive the circuit similarity to a target class, even though the
-     trajectory itself is globally pooled (per-channel gradient weights
-     applied to the spatial map still vary across channels and positions).
+Stage 7 — trajectory divergence (novel diagnostic):
+  Uses the raw 8-layer activation trajectory (before MetaEncoder compression)
+  to answer *at which layer* a specific image's processing diverges from the
+  expected path for its true class.  No additional training required.
+  Key quantities:
+    - divergence_curve:        per-layer cosine distance to true-class centroid
+    - layer_class_similarities: per-layer cosine similarity to all 10 classes
+    - defection layer:          first layer where sim(pred) > sim(true)
 
 Note on activation maximization:
-  The backbone hook computes `tensor.mean(dim=[2,3])` (global average pool)
-  before storing each trajectory step.  This makes d(traj)/d(x[h,w])
-  spatially uniform — every pixel gets the same gradient direction, so
-  pixel-optimisation converges to uniform gray regardless of regularisation.
-  Nearest-neighbor retrieval and GradCAM avoid this limitation entirely.
+  The backbone hook globally-average-pools before storing each trajectory
+  step.  This makes d(traj)/d(x[h,w]) spatially uniform — pixel optimisation
+  converges to uniform gray.  Nearest-neighbor retrieval and GradCAM are
+  used instead.
 
 Usage:
     from evaluation.circuit_analysis import CircuitAnalyzer, denormalize, CIFAR10_CLASSES
     analyzer = CircuitAnalyzer(backbone, meta_encoder, val_loader, device)
+    # Stage 6
     z, logits, x, labels = analyzer.collect_all()
     centroids = analyzer.class_centroids(z, labels)
-    _, imgs, lbls, sims = analyzer.nearest_to_target(centroids[3], z, x, labels)
-    cam = analyzer.gradcam(x[i], centroids[5])
+    # Stage 7
+    trajs, logits, labels = analyzer.collect_trajectories()
+    lc = analyzer.layer_class_centroids(trajs, labels)
+    curve = analyzer.trajectory_divergence_curve([trajs[l][i] for l in range(8)], true_cls, lc)
 """
 
 import torch
@@ -195,6 +200,114 @@ class CircuitAnalyzer:
         sims[(sims - 1.0).abs() < 1e-5] = -2.0
         topk   = sims.topk(k).indices
         return topk, all_x[topk], 1 - sims[topk]
+
+    # ------------------------------------------------------------------ #
+    # Trajectory divergence analysis (Stage 7)
+    # ------------------------------------------------------------------ #
+
+    @torch.no_grad()
+    def collect_trajectories(self, max_samples: int = 10000):
+        """
+        Collect raw per-layer activations (before MetaEncoder) for all val samples.
+
+        Returns:
+            trajs:  list of L tensors, each [N, D_l]  — per-layer activations (CPU)
+            logits: [N, num_classes]                   — softmax probabilities (CPU)
+            labels: [N]                                — integer class labels (CPU)
+        """
+        self.backbone.eval()
+
+        all_trajs: list[list] = None   # type: ignore[assignment]
+        all_logits, all_labels = [], []
+        n = 0
+
+        for batch in self.loader:
+            imgs   = batch[0].to(self.device)
+            labels = batch[-1]
+
+            raw_logits, traj = self.backbone(imgs)
+
+            if all_trajs is None:
+                all_trajs = [[] for _ in range(len(traj))]
+            for l, h in enumerate(traj):
+                all_trajs[l].append(h.cpu())
+
+            all_logits.append(F.softmax(raw_logits, dim=-1).cpu())
+            all_labels.append(labels.cpu())
+
+            n += imgs.shape[0]
+            if n >= max_samples:
+                break
+
+        trajs  = [torch.cat(all_trajs[l], 0)[:max_samples] for l in range(len(all_trajs))]
+        logits = torch.cat(all_logits, 0)[:max_samples]
+        labels = torch.cat(all_labels, 0)[:max_samples]
+        return trajs, logits, labels
+
+    def layer_class_centroids(
+        self,
+        trajs:  list[torch.Tensor],
+        labels: torch.Tensor,
+    ) -> list[dict]:
+        """
+        Per-layer, per-class L2-normalised centroids in raw activation space.
+
+        Returns:
+            List of L dicts, each mapping class_idx (int) → [D_l] centroid (CPU)
+        """
+        centroids = []
+        for l, h_all in enumerate(trajs):
+            layer_cents = {}
+            for cls in range(10):
+                mask = labels == cls
+                c = h_all[mask].mean(0)
+                layer_cents[cls] = F.normalize(c, dim=-1)
+            centroids.append(layer_cents)
+        return centroids
+
+    def trajectory_divergence_curve(
+        self,
+        traj:        list[torch.Tensor],
+        true_cls:    int,
+        layer_cents: list[dict],
+    ) -> torch.Tensor:
+        """
+        Per-layer cosine distance to the true-class centroid for a single image.
+
+        Args:
+            traj:        list of L tensors, each [D_l]  (single image, CPU)
+            true_cls:    ground-truth class index
+            layer_cents: as returned by layer_class_centroids
+
+        Returns:
+            [L] cosine distances  (0 = identical, 1 = orthogonal)
+        """
+        dists = []
+        for l, h in enumerate(traj):
+            cent  = layer_cents[l][true_cls]
+            h_n   = F.normalize(h, dim=-1)
+            dists.append(1.0 - (h_n * cent).sum())
+        return torch.stack(dists)
+
+    def layer_class_similarities(
+        self,
+        h:             torch.Tensor,
+        layer_cents_l: dict,
+    ) -> torch.Tensor:
+        """
+        Cosine similarity of a single layer activation to all 10 class centroids.
+
+        Args:
+            h:             [D_l]  single layer activation (CPU)
+            layer_cents_l: dict mapping class_idx → [D_l] centroid for that layer
+
+        Returns:
+            [10] cosine similarities
+        """
+        h_n = F.normalize(h, dim=-1)
+        return torch.stack([
+            (h_n * layer_cents_l[c]).sum() for c in range(10)
+        ])
 
     # ------------------------------------------------------------------ #
     # GradCAM on circuit similarity
