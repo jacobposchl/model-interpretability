@@ -1,0 +1,62 @@
+# DINO-lite SSL baseline.
+# EMA teacher-student self-distillation with a 3-layer projection head.
+# No circuit consistency loss. Uses symmetric DINO loss on both views.
+#
+# "lite" because we use 2 global views only (no local crops) — a simpler
+# implementation that still captures the core DINO mechanism.
+
+experiment:
+  name: dino_cifar10
+  stage: ssl_dino
+
+model:
+  arch: resnet18
+  num_classes: 10
+  pretrained: false
+  meta_encoder:
+    hidden_dim: 256
+    embedding_dim: 64
+    encoder_type: mlp
+  soft_mask:
+    init_temperature: 1.0
+  dino_head:
+    hidden_dim: 256
+    out_dim: 256
+    bottleneck_dim: 64
+
+data:
+  dataset: cifar10
+  data_dir: ./data/raw
+  batch_size: 256
+  num_workers: 4
+  download: true
+
+training:
+  method: dino
+  epochs: 200
+  optimizer: adamw
+  lr: 3.0e-4
+  weight_decay: 1.0e-4
+
+  momentum_encoder:
+    momentum: 0.996         # EMA coefficient; 0.996 is standard DINO value
+
+  dino_loss:
+    teacher_temp: 0.04      # sharp teacher distribution
+    student_temp: 0.1       # softer student distribution
+    center_momentum: 0.9    # exponential moving average for centering
+    out_dim: 256            # must match dino_head.out_dim
+
+logging:
+  checkpoint_dir: ./experiments/ssl/dino
+  log_interval: 50
+  save_every: 20
+
+evaluation:
+  linear_probe_epochs: 100
+  knn_k: 20
+  fewshot:
+    n_way: 5
+    k_shot: [1, 5]
+    n_episodes: 600
+    cifar100_split: novel

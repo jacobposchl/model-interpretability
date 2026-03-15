@@ -1,0 +1,83 @@
+# CTLS-SSL: phase-gated SimCLR + CircuitConsistencyLoss on mined neighbors.
+#
+# Phase 1 (epochs 0-49): standard SimCLR only.
+#   Purpose: bootstrap the output-space representation and populate the
+#   embedding bank so that Phase 2 neighbor mining produces meaningful pairs.
+#
+# Phase 2 (epochs 50-199): SimCLR + CircuitConsistencyLoss.
+#   Positive pairs for circuit loss: cross-instance nearest neighbors from the
+#   embedding bank, NOT same-image augmentations (which would be trivially
+#   similar — the trivial-positive problem). This requires genuine semantic
+#   alignment between different images.
+#   Lambda and tau are scheduled relative to the phase 2 start (epoch 50).
+
+experiment:
+  name: ctls_ssl_cifar10
+  stage: ssl_ctls
+
+model:
+  arch: resnet18
+  num_classes: 10
+  pretrained: false
+  meta_encoder:
+    hidden_dim: 256
+    embedding_dim: 64
+    encoder_type: mlp
+  soft_mask:
+    init_temperature: 1.0
+    final_temperature: 0.1  # annealed during Phase 2
+
+data:
+  dataset: cifar10
+  data_dir: ./data/raw
+  batch_size: 256
+  num_workers: 4
+  download: true
+
+training:
+  method: ctls_ssl
+  epochs: 200
+  optimizer: adamw
+  lr: 3.0e-4
+  weight_decay: 1.0e-4
+
+  simclr_temperature: 0.1
+
+  # Phase gating
+  warmup_phase_epochs: 50   # Phase 1: epochs 0-49 (SimCLR only, bank population)
+                             # Phase 2: epochs 50-199 (SimCLR + circuit loss)
+
+  # Circuit consistency loss (Phase 2 only, scheduled relative to epoch 50)
+  lambda_consistency:
+    init: 0.0
+    final: 1.0
+    warmup_epochs: 20        # lambda ramps from 0 to 1 over epochs 50-69
+
+  temperature:
+    init: 1.0
+    final: 0.1
+    anneal_epochs: 150       # tau anneals over the full Phase 2 duration
+
+  consistency_loss:
+    weight_scheme: linear    # depth-weighted: later layers penalised more
+
+  momentum_encoder:
+    momentum: 0.996          # EMA coefficient for embedding bank updates
+
+  embedding_bank:
+    bank_size: 50000         # = CIFAR-10 train set size
+    neighbor_k: 1            # mine 1 nearest neighbor per anchor
+
+logging:
+  checkpoint_dir: ./experiments/ssl/ctls_ssl
+  log_interval: 50
+  save_every: 20
+
+evaluation:
+  linear_probe_epochs: 100
+  knn_k: 20
+  fewshot:
+    n_way: 5
+    k_shot: [1, 5]
+    n_episodes: 600
+    cifar100_split: novel

@@ -1,3 +1,4 @@
 from evaluation.circuit_viz import CircuitVisualizer
 from evaluation.embedding_compare import EmbeddingComparator
 from evaluation.monosemanticity import MonosemanticityScorer, SparseAutoencoder
+from evaluation.fewshot import EpisodeSampler, FewShotEvaluator, SemanticDistanceGrouper
