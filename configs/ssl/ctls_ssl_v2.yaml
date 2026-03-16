@@ -1,0 +1,82 @@
+# CTLS-SSL v2: early-only circuit consistency.
+#
+# Identical to ctls_ssl.yaml except for the consistency loss weight scheme.
+#
+# Problem with v1: weight_scheme=linear puts the highest penalty on the LATEST
+# layers, forcing novel-class images to stay close to CIFAR-10 circuits at the
+# most discriminative layers. Raw-trajectory linear probe (nb05 sec 6) confirmed
+# this made CTLS-SSL 5-shot accuracy 0.049 WORSE than SimCLR.
+#
+# Fix: early_only with pivot_layer=4 applies circuit consistency only to layers
+# 1-4 (coarse shared features: edges, textures, shapes) and zero weight for
+# layers 5-8 (class-specific features). This preserves shared low-level
+# structure while leaving late layers free to diverge for novel classes.
+
+experiment:
+  name: ctls_ssl_v2_cifar10
+  stage: ssl_ctls_v2
+
+model:
+  arch: resnet18
+  num_classes: 10
+  pretrained: false
+  meta_encoder:
+    hidden_dim: 256
+    embedding_dim: 64
+    encoder_type: mlp
+  soft_mask:
+    init_temperature: 1.0
+    final_temperature: 0.1
+
+data:
+  dataset: cifar10
+  data_dir: ./data/raw
+  batch_size: 256
+  num_workers: 4
+  download: true
+
+training:
+  method: ctls_ssl
+  epochs: 200
+  optimizer: adamw
+  lr: 3.0e-4
+  weight_decay: 1.0e-4
+
+  simclr_temperature: 0.1
+
+  warmup_phase_epochs: 50
+
+  lambda_consistency:
+    init: 0.0
+    final: 1.0
+    warmup_epochs: 20
+
+  temperature:
+    init: 1.0
+    final: 0.1
+    anneal_epochs: 150
+
+  consistency_loss:
+    weight_scheme: early_only   # non-zero only for layers 1-pivot_layer
+    pivot_layer: 4              # of 8 total layers; layers 5-8 get zero weight
+
+  momentum_encoder:
+    momentum: 0.996
+
+  embedding_bank:
+    bank_size: 50000
+    neighbor_k: 1
+
+logging:
+  checkpoint_dir: ./experiments/ssl/ctls_ssl_v2
+  log_interval: 50
+  save_every: 20
+
+evaluation:
+  linear_probe_epochs: 100
+  knn_k: 20
+  fewshot:
+    n_way: 5
+    k_shot: [1, 5]
+    n_episodes: 600
+    cifar100_split: novel

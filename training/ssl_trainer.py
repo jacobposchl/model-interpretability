@@ -183,6 +183,7 @@ class SSLTrainer:
             ccfg = tcfg.get("consistency_loss", {})
             self.circuit_loss = CircuitConsistencyLoss(
                 weight_scheme=ccfg.get("weight_scheme", "linear"),
+                pivot_layer=ccfg.get("pivot_layer", 0),
             )
 
     def _build_schedulers(self):
