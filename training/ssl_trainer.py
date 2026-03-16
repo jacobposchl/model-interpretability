@@ -249,7 +249,7 @@ class SSLTrainer:
                 self._save_checkpoint(epoch, best_ssl_loss, "best.pt")
 
             if (epoch + 1) % save_every == 0:
-                self._save_checkpoint(epoch, val_acc, f"epoch_{epoch + 1}.pt")
+                self._save_checkpoint(epoch, train_metrics["ssl_loss"], f"epoch_{epoch + 1}.pt")
 
     def _train_epoch(self, epoch: int, log_interval: int, phase: int | None) -> dict:
         self.backbone.train()
@@ -399,49 +399,12 @@ class SSLTrainer:
             imgs.append(self.val_transform(img))
         return torch.stack(imgs).to(self.device)
 
-    @torch.no_grad()
     def _val_epoch(self) -> dict:
         """
-        Linear probe accuracy on the frozen backbone.
-        A single-layer linear head is trained for a fixed number of epochs then
-        evaluated — standard SSL evaluation protocol.
-
-        For simplicity during training, we report KNN-1 accuracy in circuit
-        space as a proxy. Full linear probe evaluation is done in the notebooks.
+        No-op during SSL training — labels are unavailable so no online metric
+        can be computed. Full linear probe and KNN-20 evaluation is done in the
+        notebooks after training completes.
         """
-        self.backbone.eval()
-        self.meta_encoder.eval()
-
-        # Collect all val embeddings and labels
-        all_z, all_labels = [], []
-        for x, labels in self.val_loader:
-            x = x.to(self.device)
-            _, traj = self.backbone(x)
-            z = self.meta_encoder(traj)
-            all_z.append(z.cpu())
-            all_labels.append(labels)
-        all_z = torch.cat(all_z, dim=0)        # [N_val, D]
-        all_labels = torch.cat(all_labels, dim=0)  # [N_val]
-
-        # Collect all train embeddings for KNN reference
-        all_train_z, all_train_labels = [], []
-        n_collected = 0
-        for view1, view2, _ in self.train_loader:
-            view1 = view1.to(self.device)
-            _, traj = self.backbone(view1)
-            z = self.meta_encoder(traj)
-            all_train_z.append(z.cpu())
-            all_train_labels.append(
-                # Labels not available during SSL — use None placeholder;
-                # KNN acc requires them. We skip knn if train labels missing.
-                torch.full((view1.shape[0],), -1, dtype=torch.long)
-            )
-            n_collected += view1.shape[0]
-            if n_collected >= 5000:   # sample for speed during training
-                break
-
-        # KNN-1 accuracy if train labels available (they're not in SSL mode)
-        # Fall back to a placeholder — real linear probe is in the notebooks.
         return {"acc": 0.0}
 
     def _log_epoch(self, epoch, epochs, train_metrics, tau):
