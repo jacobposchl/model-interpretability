@@ -52,8 +52,12 @@ class MomentumEncoder(nn.Module):
         super().__init__()
         self.momentum = momentum
 
-        # Deep-copy student weights; disable gradients for all teacher parameters
+        # Deep-copy student weights; disable gradients for all teacher parameters.
+        # _re_register_hooks() is required: deepcopy copies hook closures but
+        # closures capture the original instance's self, so without re-registration
+        # the teacher's forward hooks would write into the student's _trajectory.
         self.teacher_backbone = copy.deepcopy(student_backbone)
+        self.teacher_backbone._re_register_hooks()
         self.teacher_meta_encoder = copy.deepcopy(student_meta_encoder)
         self.teacher_proj_head = (
             copy.deepcopy(student_proj_head) if student_proj_head is not None else None

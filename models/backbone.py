@@ -72,6 +72,20 @@ class CTLSBackbone(nn.Module):
             h.remove()
         self._hook_handles = []
 
+    def _re_register_hooks(self):
+        """
+        Remove stale hook handles and register fresh ones.
+
+        Required after copy.deepcopy(): deepcopy copies hook closures but
+        closures capture the *original* instance's self, so the teacher
+        backbone's hooks would append into the student's _trajectory list.
+        Calling this on the copied instance fixes the reference.
+        """
+        for h in self._hook_handles:
+            h.remove()
+        self._hook_handles = []
+        self._register_hooks()
+
     # ------------------------------------------------------------------ #
     # Internal
     # ------------------------------------------------------------------ #

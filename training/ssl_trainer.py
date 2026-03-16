@@ -220,7 +220,7 @@ class SSLTrainer:
         epochs = self.cfg["training"]["epochs"]
         log_interval = self.cfg["logging"].get("log_interval", 50)
         save_every = self.cfg["logging"].get("save_every", 20)
-        best_metric = 0.0
+        best_ssl_loss = float("inf")
 
         for epoch in range(start_epoch, epochs):
             # Determine phase and update schedulers (CTLS-SSL only)
@@ -239,15 +239,14 @@ class SSLTrainer:
                 tau = 1.0
 
             train_metrics = self._train_epoch(epoch, log_interval, phase)
-            val_metrics = self._val_epoch()
+            self._val_epoch()
             self.lr_scheduler.step()
 
-            val_acc = val_metrics["acc"]
-            self._log_epoch(epoch, epochs, train_metrics, val_acc, tau)
+            self._log_epoch(epoch, epochs, train_metrics, tau)
 
-            if val_acc > best_metric:
-                best_metric = val_acc
-                self._save_checkpoint(epoch, val_acc, "best.pt")
+            if train_metrics["ssl_loss"] < best_ssl_loss:
+                best_ssl_loss = train_metrics["ssl_loss"]
+                self._save_checkpoint(epoch, best_ssl_loss, "best.pt")
 
             if (epoch + 1) % save_every == 0:
                 self._save_checkpoint(epoch, val_acc, f"epoch_{epoch + 1}.pt")
@@ -445,7 +444,7 @@ class SSLTrainer:
         # Fall back to a placeholder — real linear probe is in the notebooks.
         return {"acc": 0.0}
 
-    def _log_epoch(self, epoch, epochs, train_metrics, val_acc, tau):
+    def _log_epoch(self, epoch, epochs, train_metrics, tau):
         print(
             f"Epoch {epoch+1:3d}/{epochs} | "
             f"ssl={train_metrics['ssl_loss']:.4f} "
