@@ -1,0 +1,45 @@
+# Unified objective — Option A: Fixed Weighted Sum meta-encoder
+#
+# Depth weighting is baked into the representation geometry (fixed linear ramp
+# w_l = l / sum(1..L)) rather than applied as an external loss coefficient.
+# Single InfoNCE loss on circuit embeddings z — no L_cons, no L_supcon.
+#
+# projection_dim (d=128) controls the per-layer compression width.
+# To run d ablations, duplicate this file and change projection_dim.
+
+model:
+  arch: resnet18
+  num_classes: 10
+  pretrained: false
+  meta_encoder:
+    encoder_type: weighted_sum   # Option A: fixed linear depth ramp
+    projection_dim: 128          # d — per-layer compression dimension
+    embedding_dim: 64            # circuit embedding z dimension
+  soft_mask:
+    init_temperature: 1.0
+
+training:
+  paired: true
+  epochs: 100
+  lr: 1.0e-3
+  weight_decay: 1.0e-4
+  lambda_circuit:
+    init: 0.0
+    final: 1.0
+    warmup_epochs: 10           # warm up λ over first 10 epochs
+  temperature:
+    init: 1.0
+    final: 0.1
+    anneal_epochs: 80           # cosine anneal soft mask τ
+  infonce_temperature: 0.07     # τ for InfoNCE (not soft mask τ)
+
+data:
+  data_dir: data/cifar10
+  batch_size: 256
+  num_workers: 4
+  augment: true
+
+logging:
+  checkpoint_dir: experiments/unified_a
+  log_interval: 50
+  save_every: 10

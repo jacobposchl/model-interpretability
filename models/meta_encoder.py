@@ -6,18 +6,29 @@ per-layer representations — and compresses it into a compact vector z that
 lives in the circuit latent space.
 
 Key design choices:
-  - Each layer is projected to a common hidden dimension first, since layers
-    have different widths (e.g. [64, 64, 128, 128, 256, 256, 512, 512] for
+  - Each layer is projected to a common dimension first, since layers have
+    different widths (e.g. [64, 64, 128, 128, 256, 256, 512, 512] for
     ResNet18). This makes the encoder architecture-agnostic.
-  - Two encoder variants:
-      'mlp'         — Concatenate all projected layers, pass through 2-layer MLP.
-                      Fast, simple, works well when L is small.
-      'transformer' — Stack projected layers as a sequence with positional
-                      encodings, run a small 2-layer transformer, pool.
-                      Better when L is large or layer ordering matters.
+  - Four encoder variants:
+      'mlp'             — Concatenate all projected layers, pass through 2-layer MLP.
+                          Fast, simple, works well when L is small.
+      'transformer'     — Stack projected layers as a sequence with sinusoidal
+                          positional encodings, run a 2-layer transformer,
+                          global average pool. Better when L is large.
+      'weighted_sum'    — Project each layer to projection_dim d, then compute
+                          z = Σ_l w_l · p_l where w_l = l / Σ(1..L) (linear
+                          depth ramp). Depth weighting is a geometric property
+                          of the representation, not an external loss coefficient.
+                          Uses projection_dim, not hidden_dim.
+      'transformer_cls' — Project each layer to projection_dim d, prepend a
+                          learnable CLS token, add sinusoidal depth-encoding
+                          positional embeddings, run a 2-layer transformer,
+                          extract CLS token. Allows the model to learn which
+                          layers matter per input. Uses projection_dim.
+  - 'mlp' and 'transformer' use hidden_dim for their projectors.
+  - 'weighted_sum' and 'transformer_cls' use projection_dim for their projectors.
   - Output z has L2 normalization applied before returning, so distances in
-    the circuit latent space are cosine distances. This stabilises the
-    consistency loss and makes UMAP visualizations more meaningful.
+    the circuit latent space are cosine distances.
 """
 
 import torch
@@ -33,18 +44,39 @@ class MetaEncoder(nn.Module):
         hidden_dim: int = 256,
         embedding_dim: int = 64,
         encoder_type: str = "mlp",
+        projection_dim: int = 128,
     ):
+        """
+        Args:
+            layer_dims:     List of activation dimensions per layer (from backbone).
+            hidden_dim:     Projection dimension for 'mlp' and 'transformer' modes.
+            embedding_dim:  Dimension of output circuit embedding z.
+            encoder_type:   One of 'mlp', 'transformer', 'weighted_sum', 'transformer_cls'.
+            projection_dim: Projection dimension for 'weighted_sum' and 'transformer_cls'
+                            modes. Must be divisible by 4 for transformer_cls (4 attention
+                            heads). Has no effect on 'mlp' or 'transformer' modes.
+        """
         super().__init__()
         self.layer_dims = layer_dims
         self.encoder_type = encoder_type
         self.embedding_dim = embedding_dim
         L = len(layer_dims)
 
-        # Per-layer projection to a common hidden_dim
+        valid_types = ("mlp", "transformer", "weighted_sum", "transformer_cls")
+        if encoder_type not in valid_types:
+            raise ValueError(
+                f"encoder_type must be one of {valid_types}, got '{encoder_type}'"
+            )
+
+        # Projection dimension depends on mode: legacy modes use hidden_dim,
+        # unified-objective modes use projection_dim.
+        proj_dim = hidden_dim if encoder_type in ("mlp", "transformer") else projection_dim
+
+        # Per-layer projection to a common proj_dim
         self.projectors = nn.ModuleList([
             nn.Sequential(
-                nn.Linear(d, hidden_dim),
-                nn.LayerNorm(hidden_dim),
+                nn.Linear(d, proj_dim),
+                nn.LayerNorm(proj_dim),
                 nn.GELU(),
             )
             for d in layer_dims
@@ -52,27 +84,49 @@ class MetaEncoder(nn.Module):
 
         if encoder_type == "mlp":
             self.encoder = nn.Sequential(
-                nn.Linear(hidden_dim * L, hidden_dim),
+                nn.Linear(proj_dim * L, proj_dim),
                 nn.GELU(),
-                nn.Linear(hidden_dim, embedding_dim),
+                nn.Linear(proj_dim, embedding_dim),
             )
 
         elif encoder_type == "transformer":
-            # Positional encoding (fixed sinusoidal)
-            self.register_buffer("pos_enc", _sinusoidal_pos_enc(L, hidden_dim))
+            self.register_buffer("pos_enc", _sinusoidal_pos_enc(L, proj_dim))
             encoder_layer = nn.TransformerEncoderLayer(
-                d_model=hidden_dim,
+                d_model=proj_dim,
                 nhead=4,
-                dim_feedforward=hidden_dim * 2,
+                dim_feedforward=proj_dim * 2,
                 dropout=0.0,
                 batch_first=True,
                 norm_first=True,
             )
             self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=2)
-            self.readout = nn.Linear(hidden_dim, embedding_dim)
+            self.readout = nn.Linear(proj_dim, embedding_dim)
 
-        else:
-            raise ValueError(f"encoder_type must be 'mlp' or 'transformer', got '{encoder_type}'")
+        elif encoder_type == "weighted_sum":
+            # Fixed linear depth ramp: w_l = l / Σ(1..L), 1-indexed.
+            # Registered as a buffer so it moves with the model and is saved
+            # in state_dict, but is never updated by the optimizer.
+            weights = torch.arange(1, L + 1, dtype=torch.float)
+            weights = weights / weights.sum()
+            self.register_buffer("depth_weights", weights)  # [L]
+            self.readout = nn.Linear(proj_dim, embedding_dim)
+
+        elif encoder_type == "transformer_cls":
+            # Learnable CLS token prepended to the layer sequence.
+            self.cls_token = nn.Parameter(torch.zeros(1, 1, proj_dim))
+            nn.init.trunc_normal_(self.cls_token, std=0.02)
+            # Positional encoding covers L+1 positions (CLS + L layers).
+            self.register_buffer("pos_enc", _sinusoidal_pos_enc(L + 1, proj_dim))
+            encoder_layer = nn.TransformerEncoderLayer(
+                d_model=proj_dim,
+                nhead=4,
+                dim_feedforward=proj_dim * 2,
+                dropout=0.0,
+                batch_first=True,
+                norm_first=True,
+            )
+            self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=2)
+            self.readout = nn.Linear(proj_dim, embedding_dim)
 
     def forward(self, trajectory: list[torch.Tensor]) -> torch.Tensor:
         """
@@ -89,15 +143,30 @@ class MetaEncoder(nn.Module):
         projected = [proj(h) for proj, h in zip(self.projectors, trajectory)]
 
         if self.encoder_type == "mlp":
-            cat = torch.cat(projected, dim=-1)        # [B, hidden_dim * L]
+            cat = torch.cat(projected, dim=-1)        # [B, proj_dim * L]
             z = self.encoder(cat)                     # [B, embedding_dim]
 
-        else:  # transformer
-            stacked = torch.stack(projected, dim=1)   # [B, L, hidden_dim]
-            stacked = stacked + self.pos_enc           # add positional encoding
-            encoded = self.transformer(stacked)       # [B, L, hidden_dim]
-            pooled = encoded.mean(dim=1)              # [B, hidden_dim]
+        elif self.encoder_type == "transformer":
+            stacked = torch.stack(projected, dim=1)   # [B, L, proj_dim]
+            stacked = stacked + self.pos_enc          # add positional encoding
+            encoded = self.transformer(stacked)       # [B, L, proj_dim]
+            pooled = encoded.mean(dim=1)              # [B, proj_dim]
             z = self.readout(pooled)                  # [B, embedding_dim]
+
+        elif self.encoder_type == "weighted_sum":
+            stacked = torch.stack(projected, dim=1)   # [B, L, proj_dim]
+            w = self.depth_weights.view(1, -1, 1)     # [1, L, 1]
+            pooled = (stacked * w).sum(dim=1)         # [B, proj_dim]
+            z = self.readout(pooled)                  # [B, embedding_dim]
+
+        else:  # transformer_cls
+            B = projected[0].shape[0]
+            stacked = torch.stack(projected, dim=1)           # [B, L, proj_dim]
+            cls = self.cls_token.expand(B, -1, -1)            # [B, 1, proj_dim]
+            tokens = torch.cat([cls, stacked], dim=1)         # [B, L+1, proj_dim]
+            tokens = tokens + self.pos_enc                    # add positional encoding
+            encoded = self.transformer(tokens)                # [B, L+1, proj_dim]
+            z = self.readout(encoded[:, 0])                   # CLS → [B, embedding_dim]
 
         return F.normalize(z, dim=-1)
 

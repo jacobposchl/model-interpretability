@@ -1,0 +1,47 @@
+# Unified objective — Option B: Transformer CLS meta-encoder
+#
+# Depth weighting is learned via a 2-layer transformer with CLS pooling.
+# A learnable CLS token attends over the projected layer sequence (with
+# sinusoidal depth-encoding positional embeddings) and summarises it.
+# This lets the model learn which layers matter per input, rather than
+# applying a fixed ramp — at the cost of z whose composition varies per input.
+#
+# projection_dim (d=128) controls the per-layer compression width.
+# transformer_cls requires projection_dim divisible by 4 (4 attention heads).
+
+model:
+  arch: resnet18
+  num_classes: 10
+  pretrained: false
+  meta_encoder:
+    encoder_type: transformer_cls  # Option B: learned CLS attention
+    projection_dim: 128            # d — must be divisible by 4
+    embedding_dim: 64              # circuit embedding z dimension
+  soft_mask:
+    init_temperature: 1.0
+
+training:
+  paired: true
+  epochs: 100
+  lr: 1.0e-3
+  weight_decay: 1.0e-4
+  lambda_circuit:
+    init: 0.0
+    final: 1.0
+    warmup_epochs: 10
+  temperature:
+    init: 1.0
+    final: 0.1
+    anneal_epochs: 80
+  infonce_temperature: 0.07
+
+data:
+  data_dir: data/cifar10
+  batch_size: 256
+  num_workers: 4
+  augment: true
+
+logging:
+  checkpoint_dir: experiments/unified_b
+  log_interval: 50
+  save_every: 10
