@@ -44,24 +44,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-
-# --------------------------------------------------------------------------- #
-# CIFAR-100 fine → coarse mapping (same as in data/ssl.py; duplicated here
-# to keep evaluation/ independent of data/ for notebook convenience)
-# --------------------------------------------------------------------------- #
-
-_CIFAR100_FINE_TO_COARSE = [
-    4,  1, 14,  8,  0,  6,  7,  7, 18,  3,
-    3, 14,  9, 18,  7, 11,  3,  9,  7, 11,
-    6, 11,  5, 10,  7,  6, 13, 15,  3, 15,
-    0, 11,  1, 10, 12, 14, 16,  9, 11,  5,
-    5, 19,  8,  8, 15, 13, 14, 17, 18, 10,
-   16,  4, 17,  4,  2,  0, 17,  4, 18, 17,
-   10,  3,  2, 12, 12, 16, 12,  1,  9, 19,
-    2, 10,  0,  1, 16, 12,  9, 13, 15, 13,
-   16, 19,  2,  4,  6, 19,  5,  5,  8, 19,
-   18,  1,  2, 15,  6,  0, 17,  8, 14, 13,
-]
+from data.ssl import _CIFAR100_FINE_TO_COARSE
 
 # Novel superclasses and their semantic group
 _NOVEL_SUPERCLASS_GROUPS = {
@@ -205,17 +188,15 @@ class FewShotEvaluator:
             support_imgs = support_imgs.to(self.device)
             query_imgs = query_imgs.to(self.device)
 
-            support_z, _ = self._encode_batch(support_imgs)
-            query_z, _ = self._encode_batch(query_imgs)
+            support_z, support_logits = self._encode_batch(support_imgs)
+            query_z, query_logits = self._encode_batch(query_imgs)
 
             if use_circuit_space:
                 preds = self._prototypical_classify(
                     support_z, support_labels, query_z, episode_sampler.n_way
                 )
             else:
-                # Output-space KNN-1 fallback
-                _, support_logits = self._encode_batch(support_imgs)
-                _, query_logits = self._encode_batch(query_imgs)
+                # Output-space fallback — reuse logits from above
                 preds = self._prototypical_classify(
                     support_logits, support_labels, query_logits, episode_sampler.n_way
                 )

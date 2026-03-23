@@ -64,9 +64,9 @@ def load_model(config: dict, checkpoint_path: str, device: torch.device):
     ).to(device)
     meta_encoder = MetaEncoder(
         layer_dims=backbone.layer_dims,
-        hidden_dim=ecfg.get("hidden_dim", 256),
         embedding_dim=ecfg.get("embedding_dim", 64),
-        encoder_type=ecfg.get("encoder_type", "mlp"),
+        encoder_type=ecfg.get("encoder_type", "weighted_sum"),
+        projection_dim=ecfg.get("projection_dim", 128),
     ).to(device)
 
     ckpt = torch.load(checkpoint_path, map_location=device)
@@ -109,7 +109,7 @@ def main():
 
         print("Computing UMAP...")
         fig = viz.plot_umap(
-            title=config["experiment"]["name"],
+            title=config["logging"].get("checkpoint_dir", args.config),
             compare_output=True,
         )
         path = output_dir / "umap_circuit_vs_output.png"

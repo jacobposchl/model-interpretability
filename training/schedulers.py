@@ -12,6 +12,8 @@ Schedules for the two auxiliary hyperparameters in CTLS training:
     smooth transition that avoids sudden representation shifts.
 """
 
+import math
+
 
 class LambdaScheduler:
     """Linear warmup for the consistency loss weight λ."""
@@ -40,7 +42,6 @@ class TauScheduler:
         self.anneal_epochs = anneal_epochs
 
     def get(self, epoch: int) -> float:
-        import math
         if epoch >= self.anneal_epochs:
             return self.final_val
         progress = epoch / self.anneal_epochs

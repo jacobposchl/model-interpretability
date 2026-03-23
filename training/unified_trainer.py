@@ -73,7 +73,6 @@ class UnifiedTrainer:
         ecfg = mcfg["meta_encoder"]
         self.meta_encoder = MetaEncoder(
             layer_dims=self.backbone.layer_dims,
-            hidden_dim=ecfg.get("hidden_dim", 256),
             embedding_dim=ecfg.get("embedding_dim", 64),
             encoder_type=ecfg.get("encoder_type", "weighted_sum"),
             projection_dim=ecfg.get("projection_dim", 128),

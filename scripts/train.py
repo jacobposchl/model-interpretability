@@ -2,17 +2,17 @@
 CLI entry point for training.
 
 Examples:
-    # Stage 1 — baseline, no consistency loss
+    # Baseline — no consistency loss
     python scripts/train.py --config configs/baseline.yaml
 
-    # Stage 2 — full CTLS objective
-    python scripts/train.py --config configs/ctls.yaml
+    # CTLS — Option A (fixed weighted-sum meta-encoder)
+    python scripts/train.py --config configs/unified_a.yaml
+
+    # CTLS — Option B (transformer CLS meta-encoder)
+    python scripts/train.py --config configs/unified_b.yaml
 
     # Resume from checkpoint
-    python scripts/train.py --config configs/ctls.yaml --resume experiments/ctls/epoch_50.pt
-
-    # Stage 4 ablation — uniform depth weighting
-    python scripts/train.py --config configs/ablations/uniform_weighting.yaml
+    python scripts/train.py --config configs/unified_b.yaml --resume experiments/unified_b/epoch_50.pt
 """
 
 import argparse
@@ -23,7 +23,7 @@ import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import yaml
-from training.trainer import Trainer
+from training.unified_trainer import UnifiedTrainer
 
 
 def parse_args():
@@ -39,12 +39,13 @@ def main():
     with open(args.config) as f:
         config = yaml.safe_load(f)
 
-    print(f"Experiment: {config['experiment']['name']}")
+    checkpoint_dir = config["logging"]["checkpoint_dir"]
     print(f"Config:     {args.config}")
+    print(f"Output dir: {checkpoint_dir}")
     if args.resume:
         print(f"Resuming:   {args.resume}")
 
-    trainer = Trainer(config)
+    trainer = UnifiedTrainer(config)
     trainer.train(resume_from=args.resume)
 
 
