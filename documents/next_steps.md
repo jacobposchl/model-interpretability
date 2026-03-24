@@ -16,7 +16,9 @@ These steps follow directly from the validation experiment (Steps 1–3). They m
 **Status:** `not started`
 
 **What it is:**
-The current implementation extracts globally average-pooled post-block activations as `h_l`. This is a reasonable default but may not be the representation that best tracks causal circuit structure. This step compares alternative extraction strategies against the existing activation-patching ground truth to find the one with highest proxy validity.
+The current implementation extracts globally average-pooled post-block activations as `h_l`. This is a reasonable default but may not be the representation that best captures circuit structure. This step compares alternative extraction strategies against the per-layer trajectory similarity ground truth (now established in nb01) to find the one with highest proxy validity.
+
+**Updated context:** The revised validation (nb01 rev.2) showed that z is dominated by layers 7–8 and adds no measurable benefit over h₈ for class discrimination. Before redesigning the training signal (Step 5), it is worth checking whether a different extraction strategy at early layers produces more informative representations — if spatially-resolved or gradient-weighted activations show larger early-layer gaps, that would justify retaining the multi-layer architecture before changing the positive pair definition.
 
 **Details:**
 Three alternatives to test against the current approach:
@@ -24,22 +26,22 @@ Three alternatives to test against the current approach:
 - **Spatially-resolved activations** — flatten instead of average-pool, keeping spatial dimensions. Captures *where* in the image the computation happens, not just *what* activates.
 - **Gradient-weighted activations** (GradCAM-style) — weight each activation by its gradient w.r.t. the final logit. More directly causal since it measures each activation's contribution to the output.
 
-For each strategy: swap out the extraction hook, recompute `z` using the same trained meta-encoder (no retraining needed), and rerun Spearman ρ against the existing patching ground truth. The patching results do not need to be re-run — they are a property of the model's causal structure, not of how `z` is extracted.
+For each strategy: swap out the extraction hook, recompute `z` using the same trained meta-encoder (no retraining needed), and rerun Spearman ρ against the per-layer trajectory similarity ground truth from nb01. Also check whether the per-layer gap table changes — does any strategy show larger early-layer separation?
 
-**Expected outcome:** Whichever strategy produces the highest ρ against patching ground truth is the correct extraction method. If all strategies produce similar ρ, global average pooling is defensible as the default.
+**Expected outcome:** If any strategy shows meaningfully larger early-layer gaps and higher proxy ρ, it should be adopted before Step 5. If all strategies show the same late-layer dominance, the conclusion is that global average pooling is appropriate and the limitation is in the training signal (Step 5), not the extraction method.
 
 **Progress:**
 - [ ] Implement spatially-resolved extraction hook
 - [ ] Implement pre-nonlinearity extraction hook
 - [ ] Implement gradient-weighted extraction hook
-- [ ] Run Spearman ρ for each strategy vs. existing patching ground truth
+- [ ] Run Spearman ρ and per-layer gap table for each strategy vs. nb01 ground truth
 - [ ] Document comparison table and select winning strategy
 
 ---
 
 ### Step 5 — Positive Pair Definition: Class Labels vs. Causal Similarity
 
-**Status:** `not started`
+**Status:** `in progress`
 
 **What it is:**
 The current training signal defines positive pairs by class label — two images of the same class are a positive pair. The patching experiment revealed that ~50% of same-class image pairs have CircuitSim ≈ 0, meaning they produce the same predicted class but use completely different internal circuits. Class labels are a noisy proxy for circuit identity. This step tests whether defining positive pairs directly by patching-derived circuit similarity produces a tighter, more valid training signal.
@@ -56,11 +58,23 @@ For each definition: retrain the meta-encoder with the new positive pair definit
 
 **Dependency:** Requires the patching harness from Step 2 (already complete). Optionally benefits from the best extraction strategy identified in Step 4.
 
+**Implementation notes (nb02):**
+- Positive pairs defined by uniform-mean trajectory similarity: `m(x) = normalize(mean_l(p_l(x)))`,
+  computed from Phase 1 model projectors. Gives equal weight to all 8 layers (vs. nb01's depth ramp).
+- Two-phase training: Phase 1 (30 epochs class-label) → precompute top-k (k=20) trajectory-similar
+  neighbors per training image → Phase 2 (70 epochs traj-sim pairs).
+- Non-triviality tests: T1 (collapse ordering), T2 (z > h₈), T3 (early-layer gaps), T4 (cross-class
+  pairs), T5 (per-layer ρ profile). All with bootstrap 95% CIs and permutation p-values.
+
 **Progress:**
-- [ ] Define CircuitSim threshold for positive pair selection
-- [ ] Implement causal-similarity pair sampler (replaces PairedCIFAR10 class-based sampler)
-- [ ] Retrain with causal positive pairs, evaluate ρ and silhouette
-- [ ] Compare against class-label baseline
+- [x] Implement uniform-trajectory-similarity pair sampler (TrajSimPairedCIFAR10 in nb02)
+- [x] Implement batched top-k NN search (no faiss dependency)
+- [x] Two-phase training loop with checkpoint saving
+- [x] Full validation battery (proxy ρ, per-layer ρ, gap table, augmentation invariance, UMAP)
+- [x] Five non-triviality tests with bootstrap CIs and permutation tests
+- [ ] Run nb02 in Colab and record results
+- [ ] Evaluate whether Phase 1 bootstrap is sufficient or if pure-baseline pairs are needed
+- [ ] Update results.md with nb02 findings
 - [ ] Decide on positive pair definition going forward
 
 ---

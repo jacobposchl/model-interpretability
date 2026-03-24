@@ -19,8 +19,10 @@ For planned experiments and future directions: [documents/next_steps.md](documen
 
 ## Status
 
-- **Steps 1–3 complete:** Unified objective implemented and validated. Trajectory cosine similarity tracks causal circuit similarity at Spearman ρ = 0.71–0.74 against activation-patching ground truth.
-- **Steps 4–6 pending:** Activation extraction ablation, positive pair definition experiments, SSL extension.
+- **Steps 1–3 complete:** Unified objective implemented and validated. Trajectory cosine similarity tracks per-layer activation similarity at Spearman ρ = 0.797/0.781 (95% CI [0.775, 0.816] / [0.756, 0.801]) against a continuous per-layer ground truth.
+- **Key finding:** Class-discriminative structure concentrates in layers 7–8 (gap 0.53 at layer 8 vs 0.015 at layer 1). z is dominated by those layers (per-layer ρ = 0.91 at layer 8). z ≈ h₈ in discriminative power, indicating class-level collapse from class-label positive pairs.
+- **Step 5 in progress:** Positive pair redefinition — replacing class-label pairs with trajectory-similarity-derived pairs to break class-level collapse and force multi-layer circuit organization.
+- **Steps 4, 6 pending:** Activation extraction ablation, SSL extension.
 
 ---
 
@@ -33,7 +35,8 @@ For planned experiments and future directions: [documents/next_steps.md](documen
 | Output silhouette | 0.807 | 0.824 |
 | Intraclass ρ (mean) | 0.295 | 0.714 |
 | Noise ratio (σ=0.3) | 0.295 | 0.818 |
-| Proxy ρ vs. patching | — | 0.717–0.743 |
+| Proxy ρ vs. per-layer traj sim | — | 0.797 / 0.781 |
+| Proxy ρ 95% CI | — | [0.775, 0.816] / [0.756, 0.801] |
 
 ---
 

@@ -127,9 +127,11 @@ CTLS achieves higher circuit silhouette but lower monosemanticity — the monose
 
 ---
 
-## Part 2 — Validation Experiment (Steps 1–3)
+## Part 2 — Validation Experiment (Steps 1–3, original)
 
 This experiment implemented the unified objective and validated the trajectory proxy against activation-patching ground truth.
+
+> **Note:** Steps 2–3 of this experiment used activation patching as the ground truth. That measure has a known cascade confound (patching at layer l disrupts all downstream layers simultaneously), which produced a binary CircuitSim distribution and limited interpretability. The refined validation in Part 3 supersedes Steps 2–3 with a cleaner ground truth. Step 1 (unified objective sanity check) and its results remain valid and are the reference baseline.
 
 ---
 
@@ -234,61 +236,176 @@ This is essentially identical to the overall ρ of 0.717. The between-class sepa
 
 ---
 
-## Part 3 — Cross-Cutting Findings
+## Part 3 — Refined Validation Experiment (nb01, rev.2)
 
-### Option A vs. Option B
-
-Option B consistently outperforms Option A on proxy validation (ρ = 0.743 vs 0.717) while being essentially identical on sanity metrics. The advantage is modest but consistent.
-
-The likely mechanism: the dominant patching layer varies per pair with no consistent depth bias. Option B's per-input attention weights can focus on whichever layer is causally important for each specific pair. A fixed ramp cannot do this — it always weights layer 8 more regardless of whether a given pair's circuit difference is at layer 3 or layer 7.
-
-The tradeoff: Option A's z has fixed composition — two inputs' z-similarity is a fixed-weight combination of their per-layer similarities, making z-space directly auditable. Option B's composition varies per input, making distances harder to interpret uniformly.
-
-At the current margin (0.026 ρ), neither is clearly superior. The decision depends on whether you prioritize predictive accuracy of the proxy (Option B) or interpretability of the circuit embedding itself (Option A).
-
-### The Depth Ramp Is Miscalibrated
-
-This is the most actionable finding beyond core proxy validation.
-
-The fixed depth ramp (Option A) assigns weights increasing from 0.03 at layer 1 to 0.22 at layer 8. The empirical patching influence, averaged over same-class pairs, is flat at ~0.125 (= 1/8, uniform) across all layers. The ramp and the actual causal structure are misaligned.
-
-**What this means:**
-- The design rationale ("late layers encode abstract semantics that should be consistent; early layers encode surface features that legitimately vary") is not confirmed by patching in ResNet18 on CIFAR-10. All layers contribute roughly equally to circuit-defining computation on average.
-- The ramp may still be a useful training prior — it may shape how the backbone learns to organize representations even if the resulting model doesn't exhibit increasing depth-importance. These are different claims.
-- A uniform weighting might be better calibrated to empirical circuit structure. Whether it also achieves equivalent circuit organization is an open question for the Step 4 ablation.
-
-### z-Space Mean Similarity
-
-z-space mean cosine similarities: Option A = 0.558, Option B = 0.527.
-
-Both are well above zero (collapsed embeddings would approach 1.0; random unit vectors in 64 dimensions approach 0). The InfoNCE objective is producing a well-spread embedding space without explicit regularization on individual per-layer projections.
+The activation patching ground truth from Part 2 Steps 2–3 had a cascade confound: replacing x_b's activations at layer l with x_a's also corrupts all downstream layers, making it impossible to attribute the output change to layer l alone. For ResNet18 on diverse CIFAR-10 pairs, this produced a binary CircuitSim distribution (0 or 1) rather than a continuous one. The refined validation replaces patching with per-layer cosine similarity measured independently at each layer.
 
 ---
 
-## Part 4 — Complete Results Summary
+### Step 2 (revised) — Per-Layer Trajectory Similarity
+
+**Ground truth:**
+
+```
+sim_l(x_a, x_b) = cos( h_l(x_a), h_l(x_b) )   for l = 1..8
+```
+
+No cascade. Each layer measured in isolation from a clean forward pass.
+
+**Per-layer same/diff-class gap (mean same-class sim − mean diff-class sim):**
+
+| Layer | Gap A (weighted_sum) | Gap B (transformer_cls) |
+|-------|---------------------|------------------------|
+| 1 | 0.0149 | 0.0175 |
+| 2 | 0.0184 | 0.0243 |
+| 3 | 0.0387 | 0.0406 |
+| 4 | 0.0332 | 0.0365 |
+| 5 | 0.0571 | 0.0610 |
+| 6 | 0.0904 | 0.0911 |
+| 7 | 0.3019 | 0.2862 |
+| 8 | 0.5253 | 0.5016 |
+
+The class-discriminative structure in ResNet18 is almost entirely concentrated in layers 7–8. Layers 1–6 show near-zero gap — same-class and diff-class pairs are nearly indistinguishable in early activations. This directly supersedes the "flat patching influence" finding from Part 2, which was an artifact of the cascade confound averaging over all downstream layers.
+
+Note: this is also consistent with the Stage 1 baseline per-layer silhouette table (Part 1), which showed layers 1–4 with negative silhouette and the jump to positive values only at layers 7–8.
+
+**Scalar trajectory similarity (mean across layers):**
+
+| Model | Same-class mean | Diff-class mean | Separation |
+|-------|----------------|----------------|-----------|
+| Option A | 0.848 | 0.713 | 0.135 |
+| Option B | 0.841 | 0.709 | 0.132 |
+
+Unlike the binary patching CircuitSim, the distributions are continuous and overlapping — the expected shape for a meaningful continuous ground truth.
+
+---
+
+### Step 3 (revised) — z-Space Proxy Validation
+
+#### Primary correlation
+
+| Model | Spearman ρ | p-value | 95% bootstrap CI |
+|-------|-----------|---------|-----------------|
+| Option A (weighted_sum) | **0.797** | 6.58e-221 | [0.775, 0.816] |
+| Option B (transformer_cls) | **0.781** | 6.29e-206 | [0.756, 0.801] |
+
+Both exceed the validation threshold of ρ > 0.5 by a large margin. The bootstrap CIs exclude zero by more than 50 standard deviations — the correlation is not a sampling artifact. These values supersede the original ρ = 0.717/0.743 against the binary patching ground truth.
+
+#### Per-layer ρ: which layers does z reflect?
+
+For each layer l, Spearman ρ between z-space cosine similarity and sim_l:
+
+| Layer | Option A ρ | Option B ρ |
+|-------|-----------|-----------|
+| 1 | 0.173 | 0.195 |
+| 2 | 0.221 | 0.259 |
+| 3 | 0.283 | 0.276 |
+| 4 | 0.313 | 0.314 |
+| 5 | 0.428 | 0.411 |
+| 6 | 0.625 | 0.611 |
+| 7 | 0.857 | 0.862 |
+| 8 | **0.913** | **0.912** |
+
+z-space similarity correlates with layer 8 at ρ = 0.91 — higher than the overall ρ of 0.797 against mean trajectory similarity. This is only possible if z is dominated by layers 7–8, with earlier layers contributing marginal signal. The meta-encoder has learned to be approximately a function of the last two blocks.
+
+#### Baseline comparison: does z add over single-layer proxies?
+
+Spearman ρ vs. pair label (1 = same-class, 0 = diff-class):
+
+| Signal | Option A | Option B |
+|--------|----------|----------|
+| z-space cosine sim | 0.837 | 0.845 |
+| h₈ cosine sim (last layer) | **0.846** | **0.846** |
+| h₁ cosine sim (first layer) | 0.137 | 0.154 |
+
+**h₈ alone matches or marginally exceeds z for class discrimination.** The full trajectory encoder — all projectors, meta-encoder weights, InfoNCE training — adds no measurable benefit over raw last-layer cosine similarity on this task. The multi-layer machinery has converged to a solution that is effectively a learned transform of h₈.
+
+---
+
+### Augmentation Invariance
+
+K=5 augmented views (random crop, horizontal flip, color jitter) of N=200 validation images. Within-image z-similarity = mean pairwise cosine similarity across the K views.
+
+| Condition | Option A | Option B |
+|-----------|----------|----------|
+| Within-image (augmented views) | 0.930 | 0.914 |
+| Same-class pairs (Section 3) | 0.937 | 0.928 |
+| Diff-class pairs (Section 3) | 0.289 | 0.173 |
+
+Within-image ≈ same-class. The expected ordering (within-image > same-class > diff-class) is not satisfied — augmented views of one image are no more similar to each other than entirely different same-class images. This means z cannot distinguish instance identity within a class; it encodes class membership only. The InfoNCE objective with class-label positive pairs has caused class-level collapse: every image of a given class maps to approximately the same region of z-space, regardless of which specific dog or airplane it is.
+
+---
+
+### Architectural Finding: End-to-End Gradient Flow
+
+Both backbone and meta-encoder are updated by a single AdamW optimizer over all parameters jointly. The trajectory tensors are not detached before being passed to the meta-encoder. The InfoNCE gradient flows: z → projectors → backbone activations → backbone weights.
+
+Because the meta-encoder weights layers 7–8 most heavily (depth ramp or learned attention), the gradient reaching the backbone is also concentrated in layers 7–8. The backbone reorganizes those layers most aggressively, making them more class-discriminative. This is a self-reinforcing cycle: stronger layer-8 gradient → layer 8 becomes more discriminative → meta-encoder weights layer 8 more → stronger gradient.
+
+This explains the h₈ ≈ z result: both the backbone and meta-encoder have jointly converged toward a solution dominated by the last two blocks. The end-to-end design is correct and working as intended — the question is whether the training signal (class-label positive pairs) is the right one to produce the intended circuit structure.
+
+---
+
+## Part 4 — Cross-Cutting Findings
+
+### Option A vs. Option B
+
+In the revised validation (Part 3), Option A achieves slightly higher ρ (0.797 vs 0.781), reversing the original ordering from Part 2 (0.717 vs 0.743). Both are well within bootstrap CI overlap, so neither is definitively superior. The revised ground truth (continuous per-layer similarity) is more informative than the original binary patching measure, so the Part 3 numbers are the more reliable comparison.
+
+The per-layer ρ profiles are nearly identical for both models (layer 8: 0.913 vs 0.912). Option B's learned attention provides no measurable advantage in terms of which layers get weighted — both converge to the same late-layer-dominant solution. The tradeoff from the original analysis remains: Option A's z is directly auditable (fixed composition); Option B's varies per input. But the gap is not meaningful at the current evaluation scale.
+
+### The Depth Ramp Finding: Revised
+
+The original finding ("depth ramp is miscalibrated; empirical patching influence is flat") was an artifact of the cascade confound. The revised per-layer gap table (Part 3) shows the opposite pattern: class-discriminative structure increases sharply with depth, with gap ratios of 35:1 between layer 8 and layer 1.
+
+**Revised interpretation:** The depth ramp direction is correct (weight later layers more), but it significantly undershoots the empirical structure. The linear ramp gives layer 8 a weight of ~8× layer 1 (0.22 vs 0.028). The empirical gap ratio is ~35× (0.525 vs 0.015). A steeper ramp — or learned weighting — would better match the actual per-layer discriminative structure of ResNet18 on CIFAR-10.
+
+Whether a steeper ramp would improve ρ, or whether the gap would simply be absorbed into h₈ dominance regardless of weighting, is an open question.
+
+### Class-Level Collapse
+
+The most important new finding from Part 3 is class-level collapse: within-image z-similarity (0.930) equals same-class pair z-similarity (0.937). z cannot distinguish instance identity within a class. The InfoNCE objective with class-label positive pairs has driven the backbone and meta-encoder to a solution where every image of a given class maps to approximately the same point in z-space.
+
+This is not a failure of the implementation — it is the rational response to the training signal. Class-label positive pairs define "same circuit" as "same class." The model optimized for that definition and achieved it. The intended goal — capturing finer-grained within-class circuit variation — requires a different positive pair definition that reflects actual circuit similarity rather than semantic category.
+
+### z-Space Mean Similarity
+
+z-space mean cosine similarities (Part 2 experiment): Option A = 0.558, Option B = 0.527.
+
+Both are well above zero (collapsed embeddings approach 1.0; random unit vectors in 64 dimensions approach 0). The InfoNCE objective produces a well-spread embedding space without explicit regularization on individual per-layer projections.
+
+---
+
+## Part 5 — Complete Results Summary
 
 | Metric | Original CTLS | Option A (unified) | Option B (unified) |
 |--------|--------------|-------------------|-------------------|
-| Circuit silhouette | 0.8097 | 0.817 | 0.819 |
-| Output silhouette | 0.8124 | 0.820 | 0.824 |
-| Intraclass ρ (mean) | 0.768 | 0.713 | 0.715 |
-| Noise ratio (σ=0.3) | 0.784 | 0.818 | 0.801 |
-| CircuitSim same-class mean | — | 0.524 | 0.534 |
-| CircuitSim diff-class mean | — | 0.000 | 0.000 |
-| Proxy Spearman ρ (all pairs) | — | 0.717 | 0.743 |
-| Proxy Spearman ρ (same-class only) | — | 0.709 | — |
-| Depth ramp vs. patching alignment | — | Miscalibrated (flat empirical) | N/A (learned) |
+| Circuit silhouette | 0.8097 | 0.808 | 0.823 |
+| Output silhouette | 0.8124 | 0.813 | 0.827 |
+| Intraclass ρ (mean) | 0.768 | 0.748 | 0.722 |
+| Noise ratio (σ=0.3) | 0.784 | 0.667 | 0.783 |
+| Proxy ρ vs. per-layer traj sim | — | **0.797** | **0.781** |
+| Proxy ρ 95% CI | — | [0.775, 0.816] | [0.756, 0.801] |
+| Proxy ρ vs. layer 8 only | — | 0.913 | 0.912 |
+| z-sim vs. h₈-sim (disc. power) | — | 0.837 vs 0.846 | 0.845 vs 0.846 |
+| Within-image aug invariance | — | 0.930 | 0.914 |
+| Same-class z-sim mean | — | 0.937 | 0.928 |
+| Diff-class z-sim mean | — | 0.289 | 0.173 |
+| (deprecated) Proxy ρ vs. patching CircuitSim | — | 0.717 | 0.743 |
 
 **Key findings summary:**
 
 | Finding | Evidence |
 |---------|---------|
 | Unified objective replicates original metrics | Circuit silhouette 0.82 vs 0.81 original |
-| Proxy validated against causal ground truth | Spearman ρ = 0.71–0.74 against activation patching |
-| Within-class circuit discrimination confirmed | Same-class-only ρ = 0.709 ≈ overall ρ |
-| ~50% of same-class pairs do not share circuits | CircuitSim bimodal: mean 0.524, std 0.499 |
-| Depth ramp does not match empirical causal structure | Patching influence flat across layers |
-| Option B slightly outperforms Option A on proxy | ρ = 0.743 vs 0.717 |
+| Proxy validated (revised, continuous GT) | ρ = 0.797/0.781 vs per-layer trajectory similarity |
+| Bootstrap CIs exclude zero | 95% CI [0.775, 0.816] / [0.756, 0.801] |
+| Class-discriminative structure is late-layer dominated | Per-layer gap: 0.015 at layer 1, 0.525 at layer 8 |
+| z dominated by layers 7–8 | Per-layer ρ: 0.913 at layer 8, 0.173 at layer 1 |
+| z ≈ h₈ in discriminative power | ρ vs labels: z = 0.837, h₈ = 0.846 (Option A) |
+| Class-level collapse from class-label pairs | Within-image sim (0.930) ≈ same-class sim (0.937) |
+| Backbone trained end-to-end; gradient concentrated in layers 7–8 | No detach() on trajectory; joint optimizer |
+| Depth ramp direction correct, magnitude understated | Gap ratio 35:1 empirically vs 8:1 in ramp |
 | CTLS accuracy improves over baseline | 94.21% vs 93.53% |
 | Output-space structure preserved | Output silhouette: +0.003 over baseline |
 | CTLS uses structured superposition | Δmono = −0.08, Δsilhouette = +0.66 |
@@ -297,6 +414,6 @@ Both are well above zero (collapsed embeddings would approach 1.0; random unit v
 
 ## Open Questions (Steps 4–6)
 
-- **Step 4:** Does a different activation extraction strategy (pre-nonlinearity, spatially-resolved, gradient-weighted) produce higher ρ against the existing patching ground truth?
-- **Step 5:** Does training with patching-derived positive pairs (CircuitSim > threshold) rather than class-label pairs produce better within-class circuit discrimination?
+- **Step 4:** Does a different activation extraction strategy (pre-nonlinearity, spatially-resolved, gradient-weighted) produce higher proxy ρ against per-layer trajectory similarity ground truth?
+- **Step 5 (now most urgent):** Does defining positive pairs by actual trajectory similarity (rather than class label) break class-level collapse, force the backbone to reorganize earlier layers, and produce a z that adds meaningfully over h₈? The h₈ ≈ z finding makes this the critical next experiment.
 - **Step 6:** Does CTLS-SSL outperform DINO/SimCLR on sample efficiency for semantically related new categories?
