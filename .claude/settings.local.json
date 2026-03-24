@@ -4,7 +4,8 @@
       "Bash(python _nb_patch.py)",
       "Bash(python -c \"import sys; [print\\(l.rstrip\\(\\)\\) for l in sys.stdin]\")",
       "Bash(python -c \"import sys; [print\\(l\\) for l in sys.stdin]\")",
-      "Bash(python -c \":*)"
+      "Bash(python -c \":*)",
+      "Bash(python rebuild_nb03.py)"
     ]
   }
 }
