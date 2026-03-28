@@ -1,2 +1,2 @@
-from training.unified_trainer import UnifiedTrainer
-from training.schedulers import LambdaScheduler, TauScheduler
+from training.unified_trainer import Phase1Trainer
+from training.schedulers import LambdaScheduler

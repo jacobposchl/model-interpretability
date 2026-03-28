@@ -1,159 +1,126 @@
-# Trainable Circuits
-### Circuit Trajectory Latent Space (CTLS) — Training Neural Networks to Be Interpretable By Design
+# Phase 1: Meta-Encoder Validation
 
----
+A self-supervised framework for learning interpretable representations of neural network computational structure. The meta-encoder reads a frozen backbone's activation trajectories and maps them into a **circuit space** where geometric proximity reflects shared internal computation.
 
-## What This Project Is
+## Core Idea
 
-Most interpretability research asks *how do we understand what a trained model learned?* This project asks something different: *what if the model was trained to be understandable in the first place?*
+Neural networks reuse recurring computational pathways — stable patterns of activation across contiguous layers. We call these **circuits**. The meta-encoder learns per-layer representations `z_1, ..., z_L` such that:
 
-CTLS enforces interpretability as a training-time structural constraint. During training, the full multi-layer activation trajectory of each input is embedded into a shared latent space via a lightweight meta-encoder. A contrastive consistency loss (InfoNCE) then forces semantically similar inputs to produce similar trajectories in that space, while semantically different inputs remain separated. The result is a model whose internal reasoning pathways are actively shaped during training to be consistent and semantically organized — not discovered after the fact.
+- Inputs processed similarly by the backbone at a given layer are close in z-space at that layer
+- The layer-by-layer structure of z-space reveals *where* in the network similarity occurs
+- Discovered circuits span identifiable, contiguous depth ranges
 
-For the full scientific context, architecture details, and motivation: [documents/research_context.md](documents/research_context.md)
-
-For all experimental results: [documents/results.md](documents/results.md)
-
-For planned experiments and future directions: [documents/next_steps.md](documents/next_steps.md)
-
----
-
-## Status
-
-- **Steps 1–3 complete:** Unified objective implemented and validated. Trajectory cosine similarity tracks per-layer activation similarity at Spearman ρ = 0.797/0.781 (95% CI [0.775, 0.816] / [0.756, 0.801]) against a continuous per-layer ground truth.
-- **Key finding:** Class-discriminative structure concentrates in layers 7–8 (gap 0.53 at layer 8 vs 0.015 at layer 1). z is dominated by those layers (per-layer ρ = 0.91 at layer 8). z ≈ h₈ in discriminative power, indicating class-level collapse from class-label positive pairs.
-- **Step 5 in progress:** Positive pair redefinition — replacing class-label pairs with trajectory-similarity-derived pairs to break class-level collapse and force multi-layer circuit organization.
-- **Steps 4, 6 pending:** Activation extraction ablation, SSL extension.
-
----
-
-## Key Results
-
-| Metric | Baseline | CTLS (unified) |
-|--------|---------|----------------|
-| Val accuracy | 93.53% | 94.21% |
-| Circuit silhouette | 0.149 | 0.819 |
-| Output silhouette | 0.807 | 0.824 |
-| Intraclass ρ (mean) | 0.295 | 0.714 |
-| Noise ratio (σ=0.3) | 0.295 | 0.818 |
-| Proxy ρ vs. per-layer traj sim | — | 0.797 / 0.781 |
-| Proxy ρ 95% CI | — | [0.775, 0.816] / [0.756, 0.801] |
-
----
-
-## Repo Structure
+## Architecture
 
 ```
-trainable-circuits/
-│
-├── documents/
-│   ├── research_context.md         # Project idea, architecture, theory, and scientific context
-│   ├── results.md                  # All experimental results (Stages 1–5 + validation Steps 1–3)
-│   └── next_steps.md               # Planned experiments and future directions (with status tracking)
-│
-├── configs/
-│   ├── unified_a.yaml              # Current — Option A: fixed depth-ramp meta-encoder
-│   ├── unified_b.yaml              # Current — Option B: transformer CLS meta-encoder
-│   ├── baseline.yaml               # No consistency loss (reference baseline)
-│   ├── ablations/
-│   │   ├── uniform_weighting.yaml  # Uniform vs depth-weighted ablation
-│   │   └── no_soft_mask.yaml       # Binary masks instead of soft
-│   └── ssl/
-│       ├── ctls_ssl_v2.yaml        # CTLS-SSL (Step 6, config template)
-│       ├── dino.yaml               # DINO baseline for SSL comparison
-│       └── simclr.yaml             # SimCLR baseline for SSL comparison
-│
-├── models/
-│   ├── backbone.py                 # ResNet/ViT with forward hooks for trajectory capture
-│   ├── meta_encoder.py             # weighted_sum and transformer_cls variants
-│   ├── momentum_encoder.py         # Momentum encoder + embedding bank (for SSL, Step 6)
-│   └── soft_mask.py                # Magnitude-weighted gating + temperature annealing
-│
-├── losses/
-│   ├── simclr.py                   # NTXentLoss — InfoNCE for the unified objective
-│   └── dino_loss.py                # DINO loss + projection head (for SSL, Step 6)
-│
-├── data/
-│   ├── cifar.py                    # CIFAR-10 with paired same-class sampling
-│   └── ssl.py                      # SSL augmentation pipeline and CIFAR-100 transfer datasets
-│
-├── training/
-│   ├── unified_trainer.py          # Trainer for the unified CTLS objective
-│   └── schedulers.py               # λ warmup and soft mask temperature schedules
-│
-├── evaluation/
-│   ├── activation_patching.py      # Causal circuit similarity via activation patching
-│   ├── circuit_analysis.py         # Circuit structure analysis utilities
-│   ├── circuit_viz.py              # UMAP/t-SNE: circuit space vs output embedding space
-│   ├── embedding_compare.py        # Distance analysis — output vs circuit space
-│   ├── fewshot.py                  # Few-shot evaluation for SSL experiments
-│   └── monosemanticity.py          # SAE-based monosemanticity scoring
-│
-├── notebooks/
-│   └── validation/
-│       └── nb01_validation_experiment.ipynb    # Steps 1–3: unified objective + proxy validation
-│
-├── scripts/
-│   ├── train.py                    # CLI training entry point
-│   └── evaluate.py                 # CLI evaluation entry point
-│
-├── tests/
-│   ├── test_meta_encoder.py        # SoftMask, weighted_sum, transformer_cls
-│   ├── test_fewshot.py             # EpisodeSampler, FewShotEvaluator, EmbeddingBank
-│   └── test_ssl_losses.py          # NTXentLoss, DINOLoss
-│
-└── requirements.txt
+Input x
+    |
+[Frozen Backbone (ResNet18)]
+    |
+h_l(x) --> GAP --> L2-normalize --> detach
+    |
+[Per-layer projectors: Linear -> GELU -> LayerNorm]
+    |
+p_1, ..., p_L
+    |
+[RoPE Transformer Encoder]
+    |
+z_1, ..., z_L  (L2-normalized per-layer circuit representations)
 ```
 
----
+## Training Objective
 
-## Setup
+```
+L = L_info + lambda * L_geometry
+```
+
+- **L_info** (fidelity): MLP predicts per-layer cosine similarity from `z_l^a * z_l^b`
+- **L_geometry** (structure): soft contrastive loss using alignment profile as target distribution
+
+No class labels are used in training. The signal comes entirely from the backbone's internal alignment profiles.
+
+## Circuit Discovery
+
+Post-training, circuits are discovered via **span-centric clustering**:
+
+1. Enumerate all `L(L+1)/2` contiguous spans `[l_start, l_end]`
+2. For each span: extract within-span profile sub-vector, apply temperature sharpening, cluster with HDBSCAN
+3. A pair can belong to circuits at multiple spans (multi-circuit membership)
+4. Canonical circuits = clusters with >1% of all pairs
+
+## Success Criteria
+
+| # | Criterion | Target |
+|---|-----------|--------|
+| 1 | Profile Reconstruction R² | >= 0.7 |
+| 2 | Geometric Consistency (Spearman ρ) | > 0.5/layer, > 0.65 mean |
+| 3 | Within-Span Similarity Elevation | cluster mean > pop mean + 1σ |
+| 4 | Circuit Diversity | >= 60% layer coverage |
+| 5 | Class Purity Distribution | bimodal (agnostic + specific) |
+
+## Repository Structure
+
+```
+models/
+  backbone.py          # Frozen backbone with configurable pooling
+  meta_encoder.py      # RoPE transformer, per-layer projectors, profile regressor
+losses/
+  info_loss.py         # L_info: profile reconstruction fidelity
+  geometry_loss.py     # L_geometry: soft contrastive with profile targets
+training/
+  unified_trainer.py   # Phase 1 training loop
+  schedulers.py        # Lambda warmup scheduler
+evaluation/
+  metrics.py           # 5 success criteria functions
+  discovery.py         # Span-centric circuit discovery pipeline
+  circuit_analysis.py  # Data collection and profile computation
+  circuit_viz.py       # UMAP, heatmaps, circuit visualizations
+data/
+  cifar.py             # CIFAR-10 data loading
+configs/
+  phase1.yaml          # Main training config
+  ablations/           # Info-only, geometry-only, pooling ablations
+scripts/
+  train.py             # CLI training entry point
+  evaluate.py          # CLI evaluation entry point
+notebooks/
+  experiments/         # Experiment notebooks (1-7)
+documents/
+  newest_iteration.md  # Detailed technical specification
+tests/
+  test_meta_encoder.py # RoPE, MetaEncoder, ProfileRegressor tests
+  test_losses.py       # InfoLoss, GeometryLoss tests
+  test_discovery.py    # Span enumeration, sharpening, discovery tests
+```
+
+## Quickstart
 
 ```bash
+# Install dependencies
 pip install -r requirements.txt
+
+# Train the meta-encoder
+python scripts/train.py --config configs/phase1.yaml
+
+# Evaluate with success criteria
+python scripts/evaluate.py --config configs/phase1.yaml \
+    --checkpoint experiments/phase1/best.pt
+
+# Run circuit discovery
+python scripts/evaluate.py --config configs/phase1.yaml \
+    --checkpoint experiments/phase1/best.pt --discover
+
+# Generate visualizations
+python scripts/evaluate.py --config configs/phase1.yaml \
+    --checkpoint experiments/phase1/best.pt --viz
 ```
 
----
+## Validation Experiments
 
-## Running Experiments
-
-**Train baseline (no consistency loss):**
-```bash
-python scripts/train.py --config configs/baseline.yaml
-```
-
-**Train CTLS — Option A (fixed depth-ramp meta-encoder):**
-```bash
-python scripts/train.py --config configs/unified_a.yaml
-```
-
-**Train CTLS — Option B (transformer CLS meta-encoder):**
-```bash
-python scripts/train.py --config configs/unified_b.yaml
-```
-
-**Evaluate a checkpoint:**
-```bash
-python scripts/evaluate.py --config configs/unified_b.yaml --checkpoint experiments/unified_b/best.pt
-```
-
-The active experiment notebook is [notebooks/validation/nb01_validation_experiment.ipynb](notebooks/validation/nb01_validation_experiment.ipynb).
-
----
-
-## Architecture in Brief
-
-The core pipeline: per-layer projectors map each activation vector to a common dimension `d`, a depth-aware meta-encoder combines them into a single circuit embedding `z`, and InfoNCE pulls same-class `z` vectors together while pushing other-class vectors apart.
-
-```
-h_l(x) ──► Linear_l + LayerNorm + GELU ──► p_l ∈ R^d
-                                              │
-                           [p₁, ..., p_L] ──► Meta-Encoder ──► z ∈ R^64 (L2-norm)
-                                                                  │
-                                         L_total = L_task + λ · InfoNCE(z₁, z₂)
-```
-
-**Option A (`weighted_sum`):** `z = Σ_l w_l · p_l` with a fixed linear depth ramp. Interpretable, auditable distances.
-
-**Option B (`transformer_cls`):** 2-layer transformer with CLS pooling and sinusoidal depth-encoding positional embeddings. Learns which layers matter per input. Achieves ρ = 0.743 vs 0.717 for Option A on proxy validation.
-
-Both configs are in [configs/unified_a.yaml](configs/unified_a.yaml) and [configs/unified_b.yaml](configs/unified_b.yaml).
+1. **Profile Reconstruction Fidelity** — R² of MLP regressor + L_info/L_geometry ablations
+2. **Geometric Consistency** — Per-layer Spearman ρ + UMAP visualization
+3. **Circuit Discovery & Span Validation** — Span-centric clustering + multi-circuit membership
+4. **Pooling Strategy Ablation** — GAP vs max vs top-k
+5. **Temperature Sensitivity** — τ_geometry × τ_discovery grid search
+6. **Transfer Across Backbone Depth** — ResNet18/34/50
+7. **Dataset Generalization** — CIFAR-100, STL-10

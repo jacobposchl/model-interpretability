@@ -1,41 +1,37 @@
 """
-Unified CTLS Trainer (Step 1 of refinement roadmap).
+Phase 1 Trainer: Meta-Encoder Validation.
 
-Replaces the two-signal system (L_cons on raw activations + L_supcon on
-meta-encoder outputs) with a single coherent objective:
+Trains a meta-encoder to learn circuit-space representations from a frozen
+backbone's activation trajectories. The backbone is never modified.
 
-    L_total = L_task + λ · InfoNCE(z₁, z₂)
+    L_total = L_info + lambda * L_geometry
 
-where z₁, z₂ are circuit embeddings from the depth-aware meta-encoder
-(encoder_type 'weighted_sum' or 'transformer_cls') for a same-class positive
-pair. Depth weighting lives inside the representation geometry, not as an
-external loss coefficient.
+where:
+  L_info:     Profile reconstruction fidelity (MLP on z_l^a * z_l^b vs s_l)
+  L_geometry: Soft contrastive geometry (profile-weighted cross-entropy in z-space)
 
-Key differences from training/trainer.py:
-  - Single auxiliary loss: NTXentLoss on z (no L_cons, no L_supcon).
-  - Meta-encoder is initialized with projection_dim from config.
-  - Lambda schedule key is 'lambda_circuit' (not 'lambda_consistency').
-  - Always runs in paired mode — the unified objective requires positive pairs.
+All pairs are formed within-batch from standard CIFAR-10 batches. No class-label
+pairing is needed — the training signal comes entirely from alignment profiles.
 """
+from __future__ import annotations
 
-import os
 from pathlib import Path
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
+from scipy.stats import spearmanr
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
 
-from models.soft_mask import SoftMask
-from models.backbone import CTLSBackbone
-from models.meta_encoder import MetaEncoder
-from losses.simclr import NTXentLoss
-from data.cifar import get_paired_loaders
-from training.schedulers import LambdaScheduler, TauScheduler
+from models.backbone import FrozenBackbone
+from models.meta_encoder import MetaEncoder, ProfileRegressor
+from losses.info_loss import InfoLoss
+from losses.geometry_loss import GeometryLoss
+from data.cifar import get_standard_loaders
+from training.schedulers import LambdaScheduler
 
 
-class UnifiedTrainer:
+class Phase1Trainer:
     def __init__(self, config: dict):
         self.cfg = config
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -54,35 +50,35 @@ class UnifiedTrainer:
     # ------------------------------------------------------------------ #
 
     def _build_models(self):
-        cfg = self.cfg
-        mcfg = cfg["model"]
+        mcfg = self.cfg["model"]
 
-        # SoftMask must stay on CPU until after CTLSBackbone.__init__ completes,
-        # because _discover_dims runs a CPU dummy forward pass.
-        self.soft_mask = SoftMask(
-            init_temperature=cfg["training"]["temperature"]["init"]
-        )
-
-        self.backbone = CTLSBackbone(
+        self.backbone = FrozenBackbone(
             arch=mcfg["arch"],
-            num_classes=mcfg["num_classes"],
-            soft_mask=self.soft_mask,
-            pretrained=mcfg.get("pretrained", False),
+            num_classes=mcfg.get("num_classes", 10),
+            pretrained=mcfg.get("pretrained", True),
+            pool_mode=mcfg.get("pool_mode", "gap"),
         ).to(self.device)
 
         ecfg = mcfg["meta_encoder"]
         self.meta_encoder = MetaEncoder(
             layer_dims=self.backbone.layer_dims,
-            embedding_dim=ecfg.get("embedding_dim", 64),
-            encoder_type=ecfg.get("encoder_type", "weighted_sum"),
             projection_dim=ecfg.get("projection_dim", 128),
+            n_heads=ecfg.get("n_heads", 4),
+            n_transformer_layers=ecfg.get("n_transformer_layers", 2),
+            dropout=ecfg.get("dropout", 0.0),
+        ).to(self.device)
+
+        rcfg = mcfg.get("regressor", {})
+        self.regressor = ProfileRegressor(
+            input_dim=ecfg.get("projection_dim", 128),
+            hidden_dim=rcfg.get("hidden_dim", 64),
         ).to(self.device)
 
     def _build_data(self):
         dcfg = self.cfg["data"]
-        self.train_loader, self.val_loader = get_paired_loaders(
-            data_dir=dcfg["data_dir"],
-            batch_size=dcfg["batch_size"],
+        self.train_loader, self.val_loader = get_standard_loaders(
+            data_dir=dcfg.get("data_dir", "data/cifar10"),
+            batch_size=dcfg.get("batch_size", 256),
             num_workers=dcfg.get("num_workers", 4),
             augment=dcfg.get("augment", True),
             download=True,
@@ -91,7 +87,8 @@ class UnifiedTrainer:
     def _build_optimizers(self):
         tcfg = self.cfg["training"]
         lr = float(tcfg.get("lr", 1e-3))
-        params = list(self.backbone.parameters()) + list(self.meta_encoder.parameters())
+        # Only meta-encoder and regressor are trained; backbone is frozen
+        params = list(self.meta_encoder.parameters()) + list(self.regressor.parameters())
         self.optimizer = AdamW(
             params,
             lr=lr,
@@ -105,25 +102,47 @@ class UnifiedTrainer:
 
     def _build_losses(self):
         tcfg = self.cfg["training"]
-        self.infonce_loss = NTXentLoss(
-            temperature=float(tcfg.get("infonce_temperature", 0.07))
+        self.info_loss = InfoLoss(regressor=self.regressor)
+        self.geometry_loss = GeometryLoss(
+            temperature=float(tcfg.get("geometry_temperature", 0.1))
         )
+        self.info_loss_weight = float(tcfg.get("info_loss_weight", 1.0))
 
     def _build_schedulers(self):
         tcfg = self.cfg["training"]
-        lcfg = tcfg["lambda_circuit"]
+        lcfg = tcfg.get("lambda_geometry", {})
         self.lambda_scheduler = LambdaScheduler(
             init_val=lcfg.get("init", 0.0),
             final_val=lcfg.get("final", 1.0),
             warmup_epochs=lcfg.get("warmup_epochs", 10),
         )
-        taucfg = tcfg["temperature"]
-        self.tau_scheduler = TauScheduler(
-            init_val=taucfg.get("init", 1.0),
-            final_val=taucfg.get("final", 0.1),
-            anneal_epochs=taucfg.get("anneal_epochs", 80),
-        )
         self.lambda_val = self.lambda_scheduler.get(0)
+
+    # ------------------------------------------------------------------ #
+    # Profile computation
+    # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def compute_profiles(trajectory: list[torch.Tensor]) -> torch.Tensor:
+        """
+        Compute pairwise alignment profiles from L2-normalized trajectory.
+
+        Args:
+            trajectory: list of L tensors, each [B, D_l], L2-normalized
+
+        Returns:
+            profiles: [B, B, L] pairwise per-layer cosine similarities
+        """
+        L = len(trajectory)
+        B = trajectory[0].shape[0]
+        device = trajectory[0].device
+
+        profiles = torch.empty(B, B, L, device=device)
+        for l in range(L):
+            # h_l is already L2-normalized, so dot product = cosine sim
+            profiles[:, :, l] = trajectory[l] @ trajectory[l].t()
+
+        return profiles
 
     # ------------------------------------------------------------------ #
     # Training loop
@@ -131,7 +150,7 @@ class UnifiedTrainer:
 
     def train(self, resume_from: str | None = None):
         start_epoch = 0
-        best_val_acc = 0.0
+        best_val_r2 = -float("inf")
 
         if resume_from is not None:
             start_epoch = self._load_checkpoint(resume_from)
@@ -142,8 +161,6 @@ class UnifiedTrainer:
 
         for epoch in range(start_epoch, epochs):
             self.lambda_val = self.lambda_scheduler.get(epoch)
-            tau = self.tau_scheduler.get(epoch)
-            self.soft_mask.set_temperature(tau)
 
             train_metrics = self._train_epoch(epoch, log_interval)
             val_metrics = self._val_epoch()
@@ -152,113 +169,181 @@ class UnifiedTrainer:
             print(
                 f"Epoch {epoch+1:3d}/{epochs} | "
                 f"loss={train_metrics['loss']:.4f} "
-                f"task={train_metrics['task_loss']:.4f} "
-                f"infonce={train_metrics['infonce_loss']:.4f} | "
-                f"val_acc={val_metrics['acc']:.3f} | "
-                f"λ={self.lambda_val:.3f} τ={tau:.3f}"
+                f"info={train_metrics['info_loss']:.4f} "
+                f"geom={train_metrics['geometry_loss']:.4f} | "
+                f"val_R2={val_metrics['r2']:.3f} "
+                f"val_rho={val_metrics['mean_rho']:.3f} | "
+                f"lambda={self.lambda_val:.3f}"
             )
 
-            is_best = val_metrics["acc"] > best_val_acc
+            is_best = val_metrics["r2"] > best_val_r2
             if is_best:
-                best_val_acc = val_metrics["acc"]
-                self._save_checkpoint(epoch, val_metrics["acc"], name="best.pt")
+                best_val_r2 = val_metrics["r2"]
+                self._save_checkpoint(epoch, val_metrics, name="best.pt")
 
             if (epoch + 1) % save_every == 0:
-                self._save_checkpoint(epoch, val_metrics["acc"], name=f"epoch_{epoch+1}.pt")
+                self._save_checkpoint(epoch, val_metrics, name=f"epoch_{epoch+1}.pt")
 
     def _train_epoch(self, epoch: int, log_interval: int) -> dict:
-        self.backbone.train()
         self.meta_encoder.train()
+        self.regressor.train()
 
         total_loss = 0.0
-        total_task = 0.0
-        total_infonce = 0.0
+        total_info = 0.0
+        total_geom = 0.0
         n_batches = 0
 
-        for batch_idx, (x1, x2, labels) in enumerate(self.train_loader):
+        for batch_idx, (images, labels) in enumerate(self.train_loader):
             self.optimizer.zero_grad()
 
-            x1 = x1.to(self.device)
-            x2 = x2.to(self.device)
-            labels = labels.to(self.device)
+            images = images.to(self.device)
+            B = images.shape[0]
 
-            # Single forward pass for both views
-            B = x1.shape[0]
-            x_cat = torch.cat([x1, x2], dim=0)       # [2B, C, H, W]
-            logits_cat, traj_cat = self.backbone(x_cat)
+            # Forward through frozen backbone (no grad, already detached)
+            trajectory = self.backbone(images)
 
-            logits1 = logits_cat[:B]
-            logits2 = logits_cat[B:]
-            traj1 = [h[:B] for h in traj_cat]
-            traj2 = [h[B:] for h in traj_cat]
+            # Compute ground-truth alignment profiles [B, B, L]
+            profiles = self.compute_profiles(trajectory)
 
-            task_loss = (
-                F.cross_entropy(logits1, labels) +
-                F.cross_entropy(logits2, labels)
-            ) / 2.0
+            # Forward through meta-encoder
+            z_list = self.meta_encoder(trajectory)  # list of L tensors [B, d]
 
-            z1 = self.meta_encoder(traj1)
-            z2 = self.meta_encoder(traj2)
-            infonce_loss = self.infonce_loss(z1, z2)
+            # --- L_info ---
+            # Form all unique pairs using upper-triangle indices
+            idx_a, idx_b = torch.triu_indices(B, B, offset=1, device=self.device)
 
-            loss = task_loss + self.lambda_val * infonce_loss
+            # Gather per-layer z-vectors for each pair
+            z_pairs_a = [z_l[idx_a] for z_l in z_list]  # list of L x [N_pairs, d]
+            z_pairs_b = [z_l[idx_b] for z_l in z_list]
+
+            # Gather true similarities for pairs: [N_pairs, L]
+            true_sims_pairs = profiles[idx_a, idx_b, :]  # [N_pairs, L]
+
+            info_loss = self.info_loss(z_pairs_a, z_pairs_b, true_sims_pairs)
+
+            # --- L_geometry ---
+            geometry_loss = self.geometry_loss(z_list, profiles)
+
+            # --- Total ---
+            loss = self.info_loss_weight * info_loss + self.lambda_val * geometry_loss
 
             loss.backward()
             nn.utils.clip_grad_norm_(
-                list(self.backbone.parameters()) + list(self.meta_encoder.parameters()),
+                list(self.meta_encoder.parameters()) + list(self.regressor.parameters()),
                 max_norm=1.0,
             )
             self.optimizer.step()
 
             total_loss += loss.item()
-            total_task += task_loss.item()
-            total_infonce += infonce_loss.item()
+            total_info += info_loss.item()
+            total_geom += geometry_loss.item()
             n_batches += 1
 
             if (batch_idx + 1) % log_interval == 0:
                 print(
                     f"  [{batch_idx+1}/{len(self.train_loader)}] "
                     f"loss={loss.item():.4f} "
-                    f"task={task_loss.item():.4f} "
-                    f"infonce={infonce_loss.item():.4f}"
+                    f"info={info_loss.item():.4f} "
+                    f"geom={geometry_loss.item():.4f}"
                 )
 
         return {
-            "loss": total_loss / n_batches,
-            "task_loss": total_task / n_batches,
-            "infonce_loss": total_infonce / n_batches,
+            "loss": total_loss / max(n_batches, 1),
+            "info_loss": total_info / max(n_batches, 1),
+            "geometry_loss": total_geom / max(n_batches, 1),
         }
 
     @torch.no_grad()
     def _val_epoch(self) -> dict:
-        self.backbone.eval()
         self.meta_encoder.eval()
+        self.regressor.eval()
 
-        correct = 0
-        total = 0
+        all_predicted = []
+        all_true = []
+        per_layer_z_sims = []
+        per_layer_true_sims = []
 
-        for x1, _, labels in self.val_loader:
-            x1 = x1.to(self.device)
-            labels = labels.to(self.device)
-            logits, _ = self.backbone(x1)
-            preds = logits.argmax(dim=-1)
-            correct += (preds == labels).sum().item()
-            total += labels.size(0)
+        for images, labels in self.val_loader:
+            images = images.to(self.device)
+            B = images.shape[0]
+            if B < 2:
+                continue
 
-        return {"acc": correct / total}
+            trajectory = self.backbone(images)
+            profiles = self.compute_profiles(trajectory)
+            z_list = self.meta_encoder(trajectory)
+
+            # Profile reconstruction (for R^2)
+            idx_a, idx_b = torch.triu_indices(B, B, offset=1, device=self.device)
+            z_pairs_a = [z_l[idx_a] for z_l in z_list]
+            z_pairs_b = [z_l[idx_b] for z_l in z_list]
+            true_sims = profiles[idx_a, idx_b, :]  # [N_pairs, L]
+
+            L = len(z_list)
+            batch_pred = []
+            for l in range(L):
+                z_product = z_pairs_a[l] * z_pairs_b[l]
+                pred_l = self.regressor(z_product)  # [N_pairs]
+                batch_pred.append(pred_l)
+
+            predicted = torch.stack(batch_pred, dim=1)  # [N_pairs, L]
+            all_predicted.append(predicted.cpu())
+            all_true.append(true_sims.cpu())
+
+            # Geometric consistency (for Spearman rho)
+            for l in range(L):
+                z_sim_l = (z_list[l] @ z_list[l].t())  # [B, B]
+                true_sim_l = profiles[:, :, l]
+                # Upper triangle only
+                z_flat = z_sim_l[idx_a, idx_b].cpu().numpy()
+                t_flat = true_sim_l[idx_a, idx_b].cpu().numpy()
+                per_layer_z_sims.append((l, z_flat))
+                per_layer_true_sims.append((l, t_flat))
+
+        # Compute R^2
+        all_predicted = torch.cat(all_predicted, dim=0)
+        all_true = torch.cat(all_true, dim=0)
+        ss_res = ((all_predicted - all_true) ** 2).sum().item()
+        ss_tot = ((all_true - all_true.mean()) ** 2).sum().item()
+        r2 = 1.0 - ss_res / max(ss_tot, 1e-8)
+
+        # Compute per-layer Spearman rho
+        from collections import defaultdict
+        import numpy as np
+        layer_z = defaultdict(list)
+        layer_t = defaultdict(list)
+        for l, z_flat in per_layer_z_sims:
+            layer_z[l].append(z_flat)
+        for l, t_flat in per_layer_true_sims:
+            layer_t[l].append(t_flat)
+
+        per_layer_rho = []
+        for l in sorted(layer_z.keys()):
+            z_all = np.concatenate(layer_z[l])
+            t_all = np.concatenate(layer_t[l])
+            rho, _ = spearmanr(z_all, t_all)
+            per_layer_rho.append(rho if not np.isnan(rho) else 0.0)
+
+        mean_rho = float(np.mean(per_layer_rho)) if per_layer_rho else 0.0
+
+        return {
+            "r2": r2,
+            "mean_rho": mean_rho,
+            "per_layer_rho": per_layer_rho,
+        }
 
     # ------------------------------------------------------------------ #
     # Checkpointing
     # ------------------------------------------------------------------ #
 
-    def _save_checkpoint(self, epoch: int, val_acc: float, name: str):
+    def _save_checkpoint(self, epoch: int, val_metrics: dict, name: str):
         path = self.checkpoint_dir / name
         torch.save(
             {
                 "epoch": epoch,
-                "val_acc": val_acc,
-                "backbone_state": self.backbone.state_dict(),
+                "val_metrics": val_metrics,
                 "meta_encoder_state": self.meta_encoder.state_dict(),
+                "regressor_state": self.regressor.state_dict(),
                 "optimizer_state": self.optimizer.state_dict(),
                 "config": self.cfg,
             },
@@ -266,9 +351,13 @@ class UnifiedTrainer:
         )
 
     def _load_checkpoint(self, path: str) -> int:
-        ckpt = torch.load(path, map_location=self.device)
-        self.backbone.load_state_dict(ckpt["backbone_state"])
+        ckpt = torch.load(path, map_location=self.device, weights_only=False)
         self.meta_encoder.load_state_dict(ckpt["meta_encoder_state"])
+        self.regressor.load_state_dict(ckpt["regressor_state"])
         self.optimizer.load_state_dict(ckpt["optimizer_state"])
-        print(f"Resumed from {path} (epoch {ckpt['epoch']}, val_acc={ckpt['val_acc']:.3f})")
+        metrics = ckpt.get("val_metrics", {})
+        print(
+            f"Resumed from {path} (epoch {ckpt['epoch']}, "
+            f"R2={metrics.get('r2', 'N/A')}, rho={metrics.get('mean_rho', 'N/A')})"
+        )
         return ckpt["epoch"] + 1

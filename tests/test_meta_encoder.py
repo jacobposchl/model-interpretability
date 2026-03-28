@@ -1,5 +1,5 @@
 """
-Unit tests for MetaEncoder and SoftMask.
+Unit tests for MetaEncoder, RoPE, and ProfileRegressor.
 Run with: pytest tests/
 """
 
@@ -9,51 +9,12 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import torch
 import pytest
 
-from models.soft_mask import SoftMask
-from models.meta_encoder import MetaEncoder
-
-
-# --------------------------------------------------------------------------- #
-# SoftMask
-# --------------------------------------------------------------------------- #
-
-class TestSoftMask:
-    def test_output_shape_preserved(self):
-        mask = SoftMask(init_temperature=1.0)
-        x = torch.randn(8, 64)
-        assert mask(x).shape == x.shape
-
-    def test_high_temperature_is_smooth(self):
-        mask = SoftMask(init_temperature=100.0)
-        x = torch.tensor([1.0, -1.0, 0.0])
-        out = mask(x)
-        # At very high τ, σ(a/τ) ≈ 0.5, so out ≈ 0.5 * a
-        assert torch.allclose(out, 0.5 * x, atol=0.01)
-
-    def test_low_temperature_approaches_relu(self):
-        mask = SoftMask(init_temperature=0.001)
-        x = torch.tensor([2.0, -2.0, 0.5])
-        out = mask(x)
-        # At low τ, σ(a/τ) → 1 for a>0 and 0 for a<0
-        assert out[0].item() > 0
-        assert abs(out[1].item()) < 0.01
-
-    def test_set_temperature(self):
-        mask = SoftMask(init_temperature=1.0)
-        mask.set_temperature(0.5)
-        assert mask.temperature == 0.5
-
-    def test_temperature_floor(self):
-        mask = SoftMask()
-        mask.set_temperature(0.0)
-        assert mask.temperature >= 1e-6
-
-    def test_gradients_flow_through(self):
-        mask = SoftMask(init_temperature=1.0)
-        x = torch.randn(4, 32, requires_grad=True)
-        out = mask(x)
-        out.sum().backward()
-        assert x.grad is not None
+from models.meta_encoder import (
+    MetaEncoder,
+    ProfileRegressor,
+    RotaryPositionEmbedding,
+    RoPEMultiHeadAttention,
+)
 
 
 # --------------------------------------------------------------------------- #
@@ -68,99 +29,137 @@ def make_traj(B=4, layer_dims=LAYER_DIMS):
 
 
 # --------------------------------------------------------------------------- #
-# MetaEncoder — weighted_sum
+# RotaryPositionEmbedding
 # --------------------------------------------------------------------------- #
 
-class TestMetaEncoderWeightedSum:
+class TestRoPE:
+    def test_output_shape_preserved(self):
+        rope = RotaryPositionEmbedding(dim=32, max_positions=16)
+        q = torch.randn(2, 4, 8, 32)  # [B, heads, seq, dim]
+        k = torch.randn(2, 4, 8, 32)
+        q_rot, k_rot = rope(q, k, seq_len=8)
+        assert q_rot.shape == q.shape
+        assert k_rot.shape == k.shape
+
+    def test_different_positions_produce_different_rotations(self):
+        rope = RotaryPositionEmbedding(dim=32)
+        q = torch.ones(1, 1, 4, 32)
+        k = torch.ones(1, 1, 4, 32)
+        q_rot, _ = rope(q, k, seq_len=4)
+        # Different positions should produce different rotated vectors
+        assert not torch.allclose(q_rot[0, 0, 0], q_rot[0, 0, 1], atol=1e-5)
+        assert not torch.allclose(q_rot[0, 0, 0], q_rot[0, 0, 3], atol=1e-5)
+
+    def test_relative_distance_decay(self):
+        """Dot product between q and k should decay with position distance."""
+        rope = RotaryPositionEmbedding(dim=64)
+        # Same vector at all positions
+        v = torch.randn(1, 1, 1, 64).expand(1, 1, 8, 64).clone()
+        q_rot, k_rot = rope(v, v, seq_len=8)
+
+        # Dot product of position 0 with positions 1, 2, 4, 7
+        q0 = q_rot[0, 0, 0]
+        dots = []
+        for pos in [1, 2, 4, 7]:
+            dots.append((q0 * k_rot[0, 0, pos]).sum().item())
+
+        # Should generally decay with distance (not strictly monotonic but
+        # the nearest should be highest)
+        assert dots[0] > dots[-1], (
+            f"Adjacent positions should have higher dot product than distant ones: {dots}"
+        )
+
+
+# --------------------------------------------------------------------------- #
+# RoPEMultiHeadAttention
+# --------------------------------------------------------------------------- #
+
+class TestRoPEMultiHeadAttention:
     def test_output_shape(self):
-        enc = MetaEncoder(LAYER_DIMS, embedding_dim=64, encoder_type="weighted_sum")
-        z = enc(make_traj())
-        assert z.shape == (4, 64)
-
-    def test_output_is_unit_norm(self):
-        enc = MetaEncoder(LAYER_DIMS, embedding_dim=64, encoder_type="weighted_sum")
-        z = enc(make_traj())
-        assert torch.allclose(z.norm(dim=-1), torch.ones(4), atol=1e-5)
-
-    def test_depth_weights_sum_to_one(self):
-        enc = MetaEncoder(LAYER_DIMS, encoder_type="weighted_sum")
-        assert abs(enc.depth_weights.sum().item() - 1.0) < 1e-5
-
-    def test_depth_weights_are_increasing(self):
-        enc = MetaEncoder(LAYER_DIMS, encoder_type="weighted_sum")
-        w = enc.depth_weights
-        assert (w[1:] >= w[:-1]).all()
-
-    def test_different_batch_sizes(self):
-        enc = MetaEncoder(LAYER_DIMS, embedding_dim=64, encoder_type="weighted_sum")
-        for B in [1, 8, 32]:
-            z = enc(make_traj(B=B))
-            assert z.shape == (B, 64)
+        attn = RoPEMultiHeadAttention(d_model=128, n_heads=4)
+        x = torch.randn(2, 8, 128)  # [B, seq, d]
+        out = attn(x)
+        assert out.shape == (2, 8, 128)
 
     def test_backprop(self):
-        enc = MetaEncoder(LAYER_DIMS, embedding_dim=64, encoder_type="weighted_sum")
+        attn = RoPEMultiHeadAttention(d_model=64, n_heads=4)
+        x = torch.randn(2, 8, 64, requires_grad=True)
+        out = attn(x)
+        out.sum().backward()
+        assert x.grad is not None
+
+
+# --------------------------------------------------------------------------- #
+# MetaEncoder
+# --------------------------------------------------------------------------- #
+
+class TestMetaEncoder:
+    def test_output_is_list_of_L_tensors(self):
+        enc = MetaEncoder(LAYER_DIMS, projection_dim=128)
+        z_list = enc(make_traj())
+        assert isinstance(z_list, list)
+        assert len(z_list) == len(LAYER_DIMS)
+
+    def test_each_output_is_unit_norm(self):
+        enc = MetaEncoder(LAYER_DIMS, projection_dim=128)
+        z_list = enc(make_traj())
+        for z_l in z_list:
+            norms = z_l.norm(dim=-1)
+            assert torch.allclose(norms, torch.ones_like(norms), atol=1e-5)
+
+    def test_output_shapes(self):
+        proj_dim = 128
+        enc = MetaEncoder(LAYER_DIMS, projection_dim=proj_dim)
+        z_list = enc(make_traj(B=8))
+        for z_l in z_list:
+            assert z_l.shape == (8, proj_dim)
+
+    def test_different_batch_sizes(self):
+        enc = MetaEncoder(LAYER_DIMS, projection_dim=64, n_heads=4)
+        for B in [1, 4, 16]:
+            z_list = enc(make_traj(B=B))
+            assert all(z.shape[0] == B for z in z_list)
+
+    def test_backprop(self):
+        enc = MetaEncoder(LAYER_DIMS, projection_dim=128)
         traj = [torch.randn(4, d, requires_grad=True) for d in LAYER_DIMS]
-        z = enc(traj)
-        z.sum().backward()
+        z_list = enc(traj)
+        sum(z.sum() for z in z_list).backward()
         assert all(t.grad is not None for t in traj)
 
     def test_wrong_num_layers_raises(self):
-        enc = MetaEncoder(LAYER_DIMS, encoder_type="weighted_sum")
+        enc = MetaEncoder(LAYER_DIMS, projection_dim=128)
         with pytest.raises(AssertionError):
             enc([torch.randn(4, 64) for _ in range(3)])
 
+    def test_projection_dim_must_divide_by_heads(self):
+        with pytest.raises(AssertionError):
+            MetaEncoder(LAYER_DIMS, projection_dim=130, n_heads=4)
+
 
 # --------------------------------------------------------------------------- #
-# MetaEncoder — transformer_cls
+# ProfileRegressor
 # --------------------------------------------------------------------------- #
 
-class TestMetaEncoderTransformerCLS:
+class TestProfileRegressor:
     def test_output_shape(self):
-        enc = MetaEncoder(LAYER_DIMS, embedding_dim=64, encoder_type="transformer_cls", projection_dim=128)
-        z = enc(make_traj())
-        assert z.shape == (4, 64)
-
-    def test_output_is_unit_norm(self):
-        enc = MetaEncoder(LAYER_DIMS, embedding_dim=64, encoder_type="transformer_cls", projection_dim=128)
-        z = enc(make_traj())
-        assert torch.allclose(z.norm(dim=-1), torch.ones(4), atol=1e-5)
-
-    def test_different_batch_sizes(self):
-        enc = MetaEncoder(LAYER_DIMS, embedding_dim=64, encoder_type="transformer_cls", projection_dim=128)
-        for B in [1, 8, 16]:
-            z = enc(make_traj(B=B))
-            assert z.shape == (B, 64)
+        reg = ProfileRegressor(input_dim=128, hidden_dim=64)
+        z_product = torch.randn(16, 128)
+        out = reg(z_product)
+        assert out.shape == (16,)
 
     def test_backprop(self):
-        enc = MetaEncoder(LAYER_DIMS, embedding_dim=64, encoder_type="transformer_cls", projection_dim=128)
-        traj = [torch.randn(4, d, requires_grad=True) for d in LAYER_DIMS]
-        z = enc(traj)
-        z.sum().backward()
-        assert all(t.grad is not None for t in traj)
+        reg = ProfileRegressor(input_dim=64, hidden_dim=32)
+        z = torch.randn(8, 64, requires_grad=True)
+        out = reg(z)
+        out.sum().backward()
+        assert z.grad is not None
 
-    def test_projection_dim_must_be_divisible_by_4(self):
-        # projection_dim=130 is not divisible by 4 — transformer nhead=4 will fail
-        enc = MetaEncoder(LAYER_DIMS, encoder_type="transformer_cls", projection_dim=130)
-        with pytest.raises(Exception):
-            enc(make_traj())
-
-    def test_wrong_num_layers_raises(self):
-        enc = MetaEncoder(LAYER_DIMS, encoder_type="transformer_cls", projection_dim=128)
-        with pytest.raises(AssertionError):
-            enc([torch.randn(4, 64) for _ in range(3)])
-
-
-# --------------------------------------------------------------------------- #
-# MetaEncoder — shared
-# --------------------------------------------------------------------------- #
-
-class TestMetaEncoderShared:
-    def test_unknown_encoder_type_raises(self):
-        with pytest.raises(ValueError):
-            MetaEncoder(LAYER_DIMS, encoder_type="rnn")
-
-    def test_both_variants_produce_same_output_dim(self):
-        traj = make_traj()
-        enc_a = MetaEncoder(LAYER_DIMS, embedding_dim=32, encoder_type="weighted_sum")
-        enc_b = MetaEncoder(LAYER_DIMS, embedding_dim=32, encoder_type="transformer_cls", projection_dim=128)
-        assert enc_a(traj).shape == enc_b(traj).shape
+    def test_symmetric_input(self):
+        """z_a * z_b should equal z_b * z_a, producing identical output."""
+        reg = ProfileRegressor(input_dim=64)
+        z_a = torch.randn(4, 64)
+        z_b = torch.randn(4, 64)
+        out_ab = reg(z_a * z_b)
+        out_ba = reg(z_b * z_a)
+        assert torch.allclose(out_ab, out_ba, atol=1e-6)

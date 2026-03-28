@@ -1,0 +1,47 @@
+# Ablation: L_geometry only (no fidelity loss)
+# Tests whether geometry alone produces organized space but poor reconstruction.
+
+experiment:
+  name: ablation_geometry_only
+
+model:
+  arch: resnet18
+  num_classes: 10
+  pretrained: true
+  pool_mode: gap
+
+  meta_encoder:
+    projection_dim: 128
+    n_heads: 4
+    n_transformer_layers: 2
+    dropout: 0.0
+
+  regressor:
+    hidden_dim: 64
+
+training:
+  epochs: 100
+  lr: 1.0e-3
+  weight_decay: 1.0e-4
+  geometry_temperature: 0.1
+  info_loss_weight: 0.0       # info loss disabled
+  lambda_geometry:
+    init: 1.0
+    final: 1.0
+    warmup_epochs: 0
+
+data:
+  data_dir: data/cifar10
+  batch_size: 256
+  num_workers: 4
+  augment: true
+
+discovery:
+  tau_discovery: 0.5
+  min_cluster_fraction: 0.01
+  hdbscan_min_cluster_size: 5
+
+logging:
+  checkpoint_dir: experiments/ablations/geometry_only
+  log_interval: 50
+  save_every: 10

@@ -1,2 +1,2 @@
-from losses.simclr import NTXentLoss
-from losses.dino_loss import DINOLoss, DINOProjectionHead
+from losses.info_loss import InfoLoss
+from losses.geometry_loss import GeometryLoss

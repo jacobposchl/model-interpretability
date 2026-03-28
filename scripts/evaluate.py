@@ -1,21 +1,21 @@
 """
-CLI entry point for evaluation.
+CLI entry point for Phase 1 evaluation.
 
-Loads a trained checkpoint and runs one or more evaluation stages.
+Loads a trained meta-encoder checkpoint and runs the 5 success criteria,
+optionally with circuit discovery and visualizations.
 
 Examples:
-    # Stage 3: compare circuit vs output embedding spaces
-    python scripts/evaluate.py --config configs/ctls.yaml \\
-        --checkpoint experiments/ctls/best.pt --stage 3
+    # Run all criteria metrics
+    python scripts/evaluate.py --config configs/phase1.yaml \\
+        --checkpoint experiments/phase1/best.pt
 
-    # Stage 5: monosemanticity scoring (requires baseline checkpoint too)
-    python scripts/evaluate.py --config configs/ctls.yaml \\
-        --checkpoint experiments/ctls/best.pt \\
-        --baseline-checkpoint experiments/baseline/best.pt --stage 5
+    # Run circuit discovery
+    python scripts/evaluate.py --config configs/phase1.yaml \\
+        --checkpoint experiments/phase1/best.pt --discover
 
-    # Full UMAP visualisation (no stage flag = run viz)
-    python scripts/evaluate.py --config configs/ctls.yaml \\
-        --checkpoint experiments/ctls/best.pt --viz
+    # Generate UMAP visualizations
+    python scripts/evaluate.py --config configs/phase1.yaml \\
+        --checkpoint experiments/phase1/best.pt --viz
 """
 
 import argparse
@@ -24,57 +24,66 @@ import os
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+import numpy as np
 import torch
 import yaml
 from pathlib import Path
 
-from models.soft_mask import SoftMask
-from models.backbone import CTLSBackbone
-from models.meta_encoder import MetaEncoder
+from models.backbone import FrozenBackbone
+from models.meta_encoder import MetaEncoder, ProfileRegressor
 from data.cifar import get_standard_loaders
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Evaluate a CTLS model")
+    parser = argparse.ArgumentParser(description="Evaluate Phase 1 meta-encoder")
     parser.add_argument("--config", required=True)
     parser.add_argument("--checkpoint", required=True)
-    parser.add_argument("--baseline-checkpoint", default=None,
-                        help="Baseline checkpoint for Stage 5 comparison")
-    parser.add_argument("--stage", type=int, default=None,
-                        choices=[3, 4, 5],
-                        help="Evaluation stage to run (3, 4, or 5)")
+    parser.add_argument("--discover", action="store_true",
+                        help="Run span-centric circuit discovery")
     parser.add_argument("--viz", action="store_true",
-                        help="Run UMAP/t-SNE visualisation")
+                        help="Generate UMAP visualizations")
     parser.add_argument("--output-dir", default=None,
-                        help="Directory to save figures (defaults to checkpoint dir)")
+                        help="Directory to save outputs (defaults to checkpoint dir)")
+    parser.add_argument("--max-samples", type=int, default=2000,
+                        help="Max samples for evaluation metrics")
     return parser.parse_args()
 
 
 def load_model(config: dict, checkpoint_path: str, device: torch.device):
+    """Build models and load checkpoint."""
     mcfg = config["model"]
     ecfg = mcfg["meta_encoder"]
-    tcfg = config["training"]
+    rcfg = mcfg.get("regressor", {})
 
-    soft_mask = SoftMask(init_temperature=tcfg["temperature"]["init"]).to(device)
-    backbone = CTLSBackbone(
+    backbone = FrozenBackbone(
         arch=mcfg["arch"],
-        num_classes=mcfg["num_classes"],
-        soft_mask=soft_mask,
-        pretrained=False,
+        num_classes=mcfg.get("num_classes", 10),
+        pretrained=mcfg.get("pretrained", True),
+        pool_mode=mcfg.get("pool_mode", "gap"),
     ).to(device)
+
     meta_encoder = MetaEncoder(
         layer_dims=backbone.layer_dims,
-        embedding_dim=ecfg.get("embedding_dim", 64),
-        encoder_type=ecfg.get("encoder_type", "weighted_sum"),
         projection_dim=ecfg.get("projection_dim", 128),
+        n_heads=ecfg.get("n_heads", 4),
+        n_transformer_layers=ecfg.get("n_transformer_layers", 2),
+        dropout=ecfg.get("dropout", 0.0),
     ).to(device)
 
-    ckpt = torch.load(checkpoint_path, map_location=device)
-    backbone.load_state_dict(ckpt["backbone_state"])
-    meta_encoder.load_state_dict(ckpt["meta_encoder_state"])
-    print(f"Loaded checkpoint: {checkpoint_path} (epoch {ckpt['epoch']}, val_acc={ckpt['val_acc']:.3f})")
+    regressor = ProfileRegressor(
+        input_dim=ecfg.get("projection_dim", 128),
+        hidden_dim=rcfg.get("hidden_dim", 64),
+    ).to(device)
 
-    return backbone, meta_encoder
+    ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    meta_encoder.load_state_dict(ckpt["meta_encoder_state"])
+    regressor.load_state_dict(ckpt["regressor_state"])
+    metrics = ckpt.get("val_metrics", {})
+    r2_val = metrics.get("r2")
+    r2_str = f"{r2_val:.4f}" if r2_val is not None else "N/A"
+    print(f"Loaded: {checkpoint_path} (epoch {ckpt['epoch']}, R2={r2_str})")
+
+    return backbone, meta_encoder, regressor
 
 
 def main():
@@ -86,13 +95,13 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     dcfg = config["data"]
 
-    backbone, meta_encoder = load_model(config, args.checkpoint, device)
-    backbone.eval()
+    backbone, meta_encoder, regressor = load_model(config, args.checkpoint, device)
     meta_encoder.eval()
+    regressor.eval()
 
     _, val_loader = get_standard_loaders(
-        data_dir=dcfg["data_dir"],
-        batch_size=dcfg["batch_size"],
+        data_dir=dcfg.get("data_dir", "data/cifar10"),
+        batch_size=dcfg.get("batch_size", 256),
         num_workers=dcfg.get("num_workers", 4),
         augment=False,
     )
@@ -101,75 +110,133 @@ def main():
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # ------------------------------------------------------------------ #
-    # UMAP / t-SNE visualisation
+    # Collect representations
+    # ------------------------------------------------------------------ #
+    from evaluation.circuit_analysis import CircuitAnalyzer
+
+    analyzer = CircuitAnalyzer(backbone, meta_encoder, val_loader, device)
+    print(f"Collecting representations (max {args.max_samples} samples)...")
+    data = analyzer.collect_representations(max_samples=args.max_samples)
+
+    trajectories = data["trajectories"]
+    z_list = data["z_list"]
+    labels = data["labels"]
+    N = labels.shape[0]
+    L = len(z_list)
+    print(f"Collected {N} samples, {L} layers")
+
+    # ------------------------------------------------------------------ #
+    # Criterion 1: Profile Reconstruction R^2
+    # ------------------------------------------------------------------ #
+    from evaluation.metrics import (
+        profile_reconstruction_r2,
+        geometric_consistency,
+    )
+
+    print("\n--- Criterion 1: Profile Reconstruction ---")
+    idx_a, idx_b = torch.triu_indices(N, N, offset=1)
+    # Subsample pairs for tractability
+    n_pairs = idx_a.shape[0]
+    max_eval_pairs = 50000
+    if n_pairs > max_eval_pairs:
+        perm = torch.randperm(n_pairs)[:max_eval_pairs]
+        idx_a, idx_b = idx_a[perm], idx_b[perm]
+
+    true_sims = CircuitAnalyzer.compute_pair_profiles(trajectories, idx_a, idx_b)
+
+    # Predict
+    predicted = []
+    with torch.no_grad():
+        for l in range(L):
+            z_a = z_list[l][idx_a]
+            z_b = z_list[l][idx_b]
+            pred_l = regressor(z_a * z_b)
+            predicted.append(pred_l)
+    predicted = torch.stack(predicted, dim=1).numpy()
+    true_np = true_sims.numpy()
+
+    r2_result = profile_reconstruction_r2(predicted, true_np)
+    print(f"  R^2 = {r2_result['r2']:.4f}  (target >= 0.7, "
+          f"{'PASS' if r2_result['passes'] else 'FAIL'})")
+
+    # ------------------------------------------------------------------ #
+    # Criterion 2: Geometric Consistency
+    # ------------------------------------------------------------------ #
+    print("\n--- Criterion 2: Geometric Consistency ---")
+    z_sims = np.zeros((idx_a.shape[0], L))
+    for l in range(L):
+        z_a = z_list[l][idx_a].numpy()
+        z_b = z_list[l][idx_b].numpy()
+        z_sims[:, l] = (z_a * z_b).sum(axis=1)
+
+    gc_result = geometric_consistency(z_sims, true_np, L)
+    print(f"  Per-layer rho: {[f'{r:.3f}' for r in gc_result['per_layer_rho']]}")
+    print(f"  Mean rho = {gc_result['mean_rho']:.4f}  (target > 0.65, "
+          f"{'PASS' if gc_result['passes'] else 'FAIL'})")
+
+    # ------------------------------------------------------------------ #
+    # Circuit Discovery (optional)
+    # ------------------------------------------------------------------ #
+    if args.discover:
+        from evaluation.discovery import SpanCentricDiscovery
+        from evaluation.metrics import circuit_diversity, class_purity_distribution
+
+        disc_cfg = config.get("discovery", {})
+        discovery = SpanCentricDiscovery(
+            n_layers=L,
+            tau_discovery=disc_cfg.get("tau_discovery", 0.5),
+            min_cluster_fraction=disc_cfg.get("min_cluster_fraction", 0.01),
+            min_cluster_size=disc_cfg.get("hdbscan_min_cluster_size", 5),
+        )
+
+        print("\n--- Circuit Discovery ---")
+        profiles_flat = true_sims.numpy()
+        pair_indices = np.stack([idx_a.numpy(), idx_b.numpy()], axis=1)
+
+        circuits = discovery.discover_all(profiles_flat, pair_indices)
+        print(f"  Found {len(circuits)} canonical circuits")
+
+        for i, c in enumerate(circuits):
+            purity = SpanCentricDiscovery.compute_class_purity(
+                c, pair_indices, labels.numpy()
+            )
+            c["purity"] = purity
+            print(f"  Circuit {i}: span={c['span']}, size={c['size']}, "
+                  f"mean_sim={c['mean_similarity']:.3f}, purity={purity:.3f}")
+
+        # Criterion 4: Diversity
+        spans = [c["span"] for c in circuits]
+        div_result = circuit_diversity(spans, L)
+        print(f"\n  Criterion 4 — Coverage: {div_result['coverage']:.2f} "
+              f"(target >= 0.6, {'PASS' if div_result['passes'] else 'FAIL'})")
+
+        # Criterion 5: Class Purity Distribution
+        purities = [c["purity"] for c in circuits]
+        if purities:
+            pur_result = class_purity_distribution(purities)
+            print(f"  Criterion 5 — Agnostic(<0.3): {pur_result['n_agnostic']}, "
+                  f"Specific(>0.7): {pur_result['n_specific']} "
+                  f"({'PASS' if pur_result['passes'] else 'FAIL'})")
+
+        # Multi-circuit membership
+        membership = discovery.multi_circuit_membership(circuits, n_pairs=profiles_flat.shape[0])
+        print(f"\n  Multi-circuit membership: "
+              f"mean={membership.mean():.1f}, max={membership.max()}")
+
+    # ------------------------------------------------------------------ #
+    # Visualizations (optional)
     # ------------------------------------------------------------------ #
     if args.viz:
-        from evaluation.circuit_viz import CircuitVisualizer
-        viz = CircuitVisualizer(backbone, meta_encoder, val_loader, device)
+        from evaluation.circuit_viz import plot_per_layer_umap
 
-        print("Computing UMAP...")
-        fig = viz.plot_umap(
-            title=config["logging"].get("checkpoint_dir", args.config),
-            compare_output=True,
-        )
-        path = output_dir / "umap_circuit_vs_output.png"
-        fig.savefig(path, dpi=150, bbox_inches="tight")
-        print(f"Saved: {path}")
+        print("\n--- Generating Visualizations ---")
+        z_np = [z.numpy() for z in z_list]
+        labels_np = labels.numpy()
 
-        scores = viz.cluster_separation_score()
-        print(f"Silhouette — circuit: {scores['silhouette_circuit']:.4f}, "
-              f"output: {scores['silhouette_output']:.4f}, "
-              f"delta: {scores['delta']:.4f}")
-
-    # ------------------------------------------------------------------ #
-    # Stage 3: circuit vs output distance comparison
-    # ------------------------------------------------------------------ #
-    if args.stage == 3:
-        from evaluation.embedding_compare import EmbeddingComparator
-        comp = EmbeddingComparator(backbone, meta_encoder, device)
-
-        print("Stage 3: clean vs degraded distance comparison...")
-        results = comp.compare_clean_vs_degraded(val_loader)
-        print(f"  Output dist mean:  {results['output_dist_mean']:.4f}")
-        print(f"  Circuit dist mean: {results['circuit_dist_mean']:.4f}")
-        print(f"  Ratio (circuit/output): {results['ratio_circuit_over_output']:.3f}")
-
-        fig = comp.plot_distance_comparison(val_loader)
-        path = output_dir / "stage3_distance_comparison.png"
-        fig.savefig(path, dpi=150, bbox_inches="tight")
-        print(f"Saved: {path}")
-
-    # ------------------------------------------------------------------ #
-    # Stage 5: monosemanticity scoring
-    # ------------------------------------------------------------------ #
-    if args.stage == 5:
-        from evaluation.monosemanticity import MonosemanticityScorer
-
-        scorer = MonosemanticityScorer(backbone, val_loader, device)
-
-        if args.baseline_checkpoint:
-            baseline_backbone, _ = load_model(config, args.baseline_checkpoint, device)
-            baseline_backbone.eval()
-            comparison = scorer.compare_with_baseline(baseline_backbone)
-            print("\nLayer-by-layer monosemanticity comparison (CTLS vs baseline):")
-            for row in comparison["layer_results"]:
-                print(
-                    f"  Layer {row['layer_idx']+1:2d} | "
-                    f"mono: {row['base_mono']:.3f} → {row['ctls_mono']:.3f} "
-                    f"(Δ={row['delta_mono']:+.3f}) | "
-                    f"reuse: {row['base_reuse']:.3f} → {row['ctls_reuse']:.3f} "
-                    f"(Δ={row['delta_reuse']:+.3f})"
-                )
-        else:
-            results = scorer.score_all_layers()
-            print("\nMonosemanticity scores by layer:")
-            for r in results:
-                print(
-                    f"  Layer {r['layer_idx']+1:2d} | "
-                    f"mono={r['monosemanticity_score']:.3f} "
-                    f"entropy={r['mean_feature_entropy']:.3f} "
-                    f"reuse={r['circuit_reuse_rate']:.3f}"
-                )
+        fig = plot_per_layer_umap(z_np, labels_np)
+        path = output_dir / "umap_per_layer.png"
+        fig.savefig(str(path), dpi=150, bbox_inches="tight")
+        print(f"  Saved: {path}")
 
 
 if __name__ == "__main__":

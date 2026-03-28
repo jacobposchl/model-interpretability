@@ -1,18 +1,15 @@
 """
-CLI entry point for training.
+CLI entry point for Phase 1 meta-encoder training.
 
 Examples:
-    # Baseline — no consistency loss
-    python scripts/train.py --config configs/baseline.yaml
-
-    # CTLS — Option A (fixed weighted-sum meta-encoder)
-    python scripts/train.py --config configs/unified_a.yaml
-
-    # CTLS — Option B (transformer CLS meta-encoder)
-    python scripts/train.py --config configs/unified_b.yaml
+    # Train with default config
+    python scripts/train.py --config configs/phase1.yaml
 
     # Resume from checkpoint
-    python scripts/train.py --config configs/unified_b.yaml --resume experiments/unified_b/epoch_50.pt
+    python scripts/train.py --config configs/phase1.yaml --resume experiments/phase1/epoch_50.pt
+
+    # Ablation: info loss only
+    python scripts/train.py --config configs/ablations/info_only.yaml
 """
 
 import argparse
@@ -23,11 +20,11 @@ import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import yaml
-from training.unified_trainer import UnifiedTrainer
+from training.unified_trainer import Phase1Trainer
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Train a CTLS model")
+    parser = argparse.ArgumentParser(description="Train Phase 1 meta-encoder")
     parser.add_argument("--config", required=True, help="Path to YAML config file")
     parser.add_argument("--resume", default=None, help="Path to checkpoint to resume from")
     return parser.parse_args()
@@ -45,7 +42,7 @@ def main():
     if args.resume:
         print(f"Resuming:   {args.resume}")
 
-    trainer = UnifiedTrainer(config)
+    trainer = Phase1Trainer(config)
     trainer.train(resume_from=args.resume)
 
 
