@@ -272,18 +272,21 @@ class MetaEncoder(nn.Module):
 class ProfileRegressor(nn.Module):
     """
     MLP that takes the element-wise product z_l^a * z_l^b and predicts the
-    per-layer backbone cosine similarity s_l(a, b).
+    rich per-channel co-activation vector for backbone layer l.
 
     The element-wise product is symmetric (swapping a and b gives the same
-    vector), which is correct since cosine similarity is symmetric.
+    vector), which is correct since the rich profile is also symmetric.
+
+    output_dim matches the backbone's flattened layer dimension D_l = C*H*W,
+    so each regressor is layer-specific and instantiated per-layer in InfoLoss.
     """
 
-    def __init__(self, input_dim: int, hidden_dim: int = 64):
+    def __init__(self, input_dim: int, hidden_dim: int, output_dim: int):
         super().__init__()
         self.mlp = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
             nn.GELU(),
-            nn.Linear(hidden_dim, 1),
+            nn.Linear(hidden_dim, output_dim),
         )
 
     def forward(self, z_product: torch.Tensor) -> torch.Tensor:
@@ -292,6 +295,6 @@ class ProfileRegressor(nn.Module):
             z_product: [N, d] — element-wise product of two z vectors
 
         Returns:
-            [N] — predicted similarity (unbounded, MSE loss handles range)
+            [N, output_dim] — predicted per-channel co-activation vector
         """
-        return self.mlp(z_product).squeeze(-1)
+        return self.mlp(z_product)

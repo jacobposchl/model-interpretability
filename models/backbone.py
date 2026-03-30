@@ -8,8 +8,9 @@ Design decisions:
   - Hooks fire on the output of each major block (BasicBlock for ResNet,
     encoder block for ViT). This gives L trajectory points where L equals
     the number of blocks.
-  - ResNet spatial feature maps [B, C, H, W] are pooled to [B, C] via
-    configurable pooling strategy (GAP, max, or top-k).
+  - ResNet spatial feature maps [B, C, H, W] are flattened to [B, C*H*W],
+    preserving full spatial co-activation structure. This is the raw signal
+    used to compute the rich per-channel alignment profile.
   - ViT: CLS token [B, D] is extracted from each block's output [B, N+1, D].
   - Each layer output is L2-normalized before storage, ensuring every layer
     contributes comparably to trajectory distances regardless of activation
@@ -25,8 +26,6 @@ Supported architectures (via torchvision):
 """
 from __future__ import annotations
 
-import math
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -39,23 +38,14 @@ class FrozenBackbone(nn.Module):
         arch: str,
         num_classes: int,
         pretrained: bool = True,
-        pool_mode: str = "gap",
     ):
         """
         Args:
             arch:        Architecture name (resnet18, resnet34, etc.)
             num_classes: Number of output classes (needed for model construction).
             pretrained:  Whether to load pretrained weights.
-            pool_mode:   Pooling strategy for spatial feature maps.
-                         One of 'gap' (global average), 'max' (global max),
-                         'topk' (mean of top-10% activations by magnitude).
         """
         super().__init__()
-
-        valid_pools = ("gap", "max", "topk")
-        if pool_mode not in valid_pools:
-            raise ValueError(f"pool_mode must be one of {valid_pools}, got '{pool_mode}'")
-        self.pool_mode = pool_mode
 
         self._hook_handles: list = []
         self._trajectory: list[torch.Tensor] = []
@@ -84,6 +74,7 @@ class FrozenBackbone(nn.Module):
         """
         Returns:
             trajectory: list of L tensors, each [B, D_l], L2-normalized, detached
+                        where D_l = C_l * H_l * W_l (full flattened spatial dim)
         """
         self._trajectory = []
         with torch.no_grad():
@@ -105,38 +96,25 @@ class FrozenBackbone(nn.Module):
 
     def _make_hook(self):
         def hook(module, input, output):
-            # Normalise output to [B, D]
             if isinstance(output, (tuple, list)):
                 tensor = output[0]
             else:
                 tensor = output
 
             if tensor.dim() == 4:
-                pooled = self._pool_spatial(tensor)
+                # [B, C, H, W] -> [B, C*H*W]: preserve full spatial co-activation
+                flat = tensor.flatten(1)
             elif tensor.dim() == 3:
                 # ViT: [B, N+1, D] -> CLS token -> [B, D]
-                pooled = tensor[:, 0]
+                flat = tensor[:, 0]
             else:
-                pooled = tensor
+                flat = tensor
 
             # L2-normalize and detach (stop-gradient)
-            normed = F.normalize(pooled, dim=-1).detach()
+            normed = F.normalize(flat, dim=-1).detach()
             self._trajectory.append(normed)
 
         return hook
-
-    def _pool_spatial(self, tensor: torch.Tensor) -> torch.Tensor:
-        """Pool spatial feature maps [B, C, H, W] -> [B, C]."""
-        if self.pool_mode == "gap":
-            return tensor.mean(dim=[2, 3])
-        elif self.pool_mode == "max":
-            return tensor.amax(dim=[2, 3])
-        else:  # topk
-            B, C, H, W = tensor.shape
-            flat = tensor.flatten(2)  # [B, C, H*W]
-            k = max(1, math.ceil(0.1 * H * W))
-            topk_vals = flat.topk(k, dim=2).values  # [B, C, k]
-            return topk_vals.mean(dim=2)  # [B, C]
 
     def _discover_dims(self, arch: str) -> list[int]:
         """Run a tiny dummy forward pass to learn trajectory tensor shapes."""

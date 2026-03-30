@@ -9,7 +9,6 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import torch
 import pytest
 
-from models.meta_encoder import ProfileRegressor
 from losses.info_loss import InfoLoss
 from losses.geometry_loss import GeometryLoss
 
@@ -18,9 +17,10 @@ from losses.geometry_loss import GeometryLoss
 # Helpers
 # --------------------------------------------------------------------------- #
 
-D = 64   # projection dim
-L = 8    # layers
-B = 16   # batch size
+D = 64       # projection dim (z vector dim)
+L = 8        # layers
+B = 16       # batch size
+LAYER_DIMS = [16] * L  # small fixed D_l per layer for testing
 
 
 def make_z_list(B=B, L=L, d=D):
@@ -33,9 +33,9 @@ def make_z_list(B=B, L=L, d=D):
     return z_list
 
 
-def make_true_sims_pairwise(N_pairs=100, L=L):
-    """Random per-layer similarities for pairs."""
-    return torch.rand(N_pairs, L)
+def make_rich_targets(N_pairs=100, layer_dims=LAYER_DIMS):
+    """Random per-channel co-activation vectors for pairs (one per layer)."""
+    return [torch.rand(N_pairs, D_l) for D_l in layer_dims]
 
 
 def make_true_sims_matrix(B=B, L=L):
@@ -51,17 +51,16 @@ def make_true_sims_matrix(B=B, L=L):
 # --------------------------------------------------------------------------- #
 
 class TestInfoLoss:
-    def _make_loss(self):
-        reg = ProfileRegressor(input_dim=D, hidden_dim=32)
-        return InfoLoss(regressor=reg)
+    def _make_loss(self, layer_dims=LAYER_DIMS):
+        return InfoLoss(layer_dims=layer_dims, projection_dim=D, hidden_dim=32)
 
     def test_output_is_scalar(self):
         loss_fn = self._make_loss()
         N = 50
         z_a = [torch.randn(N, D) for _ in range(L)]
         z_b = [torch.randn(N, D) for _ in range(L)]
-        sims = make_true_sims_pairwise(N)
-        loss = loss_fn(z_a, z_b, sims)
+        targets = make_rich_targets(N)
+        loss = loss_fn(z_a, z_b, targets)
         assert loss.dim() == 0
 
     def test_positive_loss(self):
@@ -69,28 +68,25 @@ class TestInfoLoss:
         N = 50
         z_a = [torch.randn(N, D) for _ in range(L)]
         z_b = [torch.randn(N, D) for _ in range(L)]
-        sims = make_true_sims_pairwise(N)
-        loss = loss_fn(z_a, z_b, sims)
+        targets = make_rich_targets(N)
+        loss = loss_fn(z_a, z_b, targets)
         assert loss.item() > 0
 
     def test_perfect_prediction_gives_low_loss(self):
-        """If the regressor perfectly predicts similarities, loss should be ~0."""
-        reg = ProfileRegressor(input_dim=D, hidden_dim=32)
-        loss_fn = InfoLoss(regressor=reg)
-
+        """If each regressor perfectly predicts its rich target, loss should be ~0."""
+        loss_fn = self._make_loss()
         N = 20
         z_a = [torch.randn(N, D) for _ in range(L)]
         z_b = [torch.randn(N, D) for _ in range(L)]
 
-        # Compute what the regressor would predict
+        # Compute what each regressor would predict for these z-products
         with torch.no_grad():
-            fake_sims = []
-            for l in range(L):
-                pred = reg(z_a[l] * z_b[l])
-                fake_sims.append(pred)
-            fake_sims = torch.stack(fake_sims, dim=1)
+            fake_targets = [
+                loss_fn.regressors[l](z_a[l] * z_b[l])
+                for l in range(L)
+            ]
 
-        loss = loss_fn(z_a, z_b, fake_sims)
+        loss = loss_fn(z_a, z_b, fake_targets)
         assert loss.item() < 0.01
 
     def test_backprop(self):
@@ -98,10 +94,31 @@ class TestInfoLoss:
         N = 20
         z_a = [torch.randn(N, D, requires_grad=True) for _ in range(L)]
         z_b = [torch.randn(N, D, requires_grad=True) for _ in range(L)]
-        sims = make_true_sims_pairwise(N)
-        loss = loss_fn(z_a, z_b, sims)
+        targets = make_rich_targets(N)
+        loss = loss_fn(z_a, z_b, targets)
         loss.backward()
         assert all(z.grad is not None for z in z_a)
+
+    def test_regressor_output_shape(self):
+        """Each regressor should output [N, D_l] for its layer."""
+        loss_fn = self._make_loss()
+        N = 30
+        for l, D_l in enumerate(LAYER_DIMS):
+            z_prod = torch.randn(N, D)
+            out = loss_fn.regressors[l](z_prod)
+            assert out.shape == (N, D_l), f"Layer {l}: expected ({N}, {D_l}), got {out.shape}"
+
+    def test_varying_layer_dims(self):
+        """InfoLoss handles layers with different D_l values."""
+        layer_dims = [8, 16, 32, 64, 32, 16, 8, 4]
+        loss_fn = InfoLoss(layer_dims=layer_dims, projection_dim=D, hidden_dim=32)
+        N = 20
+        z_a = [torch.randn(N, D) for _ in range(L)]
+        z_b = [torch.randn(N, D) for _ in range(L)]
+        targets = [torch.rand(N, D_l) for D_l in layer_dims]
+        loss = loss_fn(z_a, z_b, targets)
+        assert loss.dim() == 0
+        assert loss.item() > 0
 
 
 # --------------------------------------------------------------------------- #

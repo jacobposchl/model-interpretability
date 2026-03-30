@@ -7,7 +7,8 @@ backbone's activation trajectories. The backbone is never modified.
     L_total = L_info + lambda * L_geometry
 
 where:
-  L_info:     Profile reconstruction fidelity (MLP on z_l^a * z_l^b vs s_l)
+  L_info:     Rich profile reconstruction fidelity (MLP_l on z_l^a * z_l^b vs
+              norm(h_l^a) ⊙ norm(h_l^b), the per-channel co-activation vector)
   L_geometry: Soft contrastive geometry (profile-weighted cross-entropy in z-space)
 
 All pairs are formed within-batch from standard CIFAR-10 batches. No class-label
@@ -15,8 +16,10 @@ pairing is needed — the training signal comes entirely from alignment profiles
 """
 from __future__ import annotations
 
+from collections import defaultdict
 from pathlib import Path
 
+import numpy as np
 import torch
 import torch.nn as nn
 from scipy.stats import spearmanr
@@ -24,7 +27,7 @@ from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
 
 from models.backbone import FrozenBackbone
-from models.meta_encoder import MetaEncoder, ProfileRegressor
+from models.meta_encoder import MetaEncoder
 from losses.info_loss import InfoLoss
 from losses.geometry_loss import GeometryLoss
 from data.cifar import get_standard_loaders
@@ -38,8 +41,8 @@ class Phase1Trainer:
 
         self._build_models()
         self._build_data()
+        self._build_losses()      # must come before _build_optimizers (optimizer needs info_loss params)
         self._build_optimizers()
-        self._build_losses()
         self._build_schedulers()
 
         self.checkpoint_dir = Path(config["logging"]["checkpoint_dir"])
@@ -56,7 +59,6 @@ class Phase1Trainer:
             arch=mcfg["arch"],
             num_classes=mcfg.get("num_classes", 10),
             pretrained=mcfg.get("pretrained", True),
-            pool_mode=mcfg.get("pool_mode", "gap"),
         ).to(self.device)
 
         ecfg = mcfg["meta_encoder"]
@@ -66,12 +68,6 @@ class Phase1Trainer:
             n_heads=ecfg.get("n_heads", 4),
             n_transformer_layers=ecfg.get("n_transformer_layers", 2),
             dropout=ecfg.get("dropout", 0.0),
-        ).to(self.device)
-
-        rcfg = mcfg.get("regressor", {})
-        self.regressor = ProfileRegressor(
-            input_dim=ecfg.get("projection_dim", 128),
-            hidden_dim=rcfg.get("hidden_dim", 64),
         ).to(self.device)
 
     def _build_data(self):
@@ -87,8 +83,11 @@ class Phase1Trainer:
     def _build_optimizers(self):
         tcfg = self.cfg["training"]
         lr = float(tcfg.get("lr", 1e-3))
-        # Only meta-encoder and regressor are trained; backbone is frozen
-        params = list(self.meta_encoder.parameters()) + list(self.regressor.parameters())
+        # Only meta-encoder and info_loss regressors are trained; backbone is frozen
+        params = (
+            list(self.meta_encoder.parameters())
+            + list(self.info_loss.parameters())
+        )
         self.optimizer = AdamW(
             params,
             lr=lr,
@@ -101,8 +100,17 @@ class Phase1Trainer:
         )
 
     def _build_losses(self):
+        mcfg = self.cfg["model"]
         tcfg = self.cfg["training"]
-        self.info_loss = InfoLoss(regressor=self.regressor)
+        ecfg = mcfg["meta_encoder"]
+        rcfg = mcfg.get("regressor", {})
+
+        self.info_loss = InfoLoss(
+            layer_dims=self.backbone.layer_dims,
+            projection_dim=ecfg.get("projection_dim", 128),
+            hidden_dim=rcfg.get("hidden_dim", 64),
+        ).to(self.device)
+
         self.geometry_loss = GeometryLoss(
             temperature=float(tcfg.get("geometry_temperature", 0.1))
         )
@@ -125,13 +133,16 @@ class Phase1Trainer:
     @staticmethod
     def compute_profiles(trajectory: list[torch.Tensor]) -> torch.Tensor:
         """
-        Compute pairwise alignment profiles from L2-normalized trajectory.
+        Compute pairwise scalar alignment profiles from L2-normalized trajectory.
+        Used by GeometryLoss (which needs [B, B, L] scalar similarities) and
+        validation Spearman correlation.
 
         Args:
             trajectory: list of L tensors, each [B, D_l], L2-normalized
 
         Returns:
             profiles: [B, B, L] pairwise per-layer cosine similarities
+                      (= mean of per-channel co-activation, scaled by D_l)
         """
         L = len(trajectory)
         B = trajectory[0].shape[0]
@@ -139,10 +150,29 @@ class Phase1Trainer:
 
         profiles = torch.empty(B, B, L, device=device)
         for l in range(L):
-            # h_l is already L2-normalized, so dot product = cosine sim
+            # h_l is L2-normalized; dot product = cosine similarity
             profiles[:, :, l] = trajectory[l] @ trajectory[l].t()
 
         return profiles
+
+    @staticmethod
+    def compute_pair_rich_profiles(
+        trajectory: list[torch.Tensor],
+        idx_a: torch.Tensor,
+        idx_b: torch.Tensor,
+    ) -> list[torch.Tensor]:
+        """
+        Compute rich per-channel co-activation vectors for specific pairs.
+        Used as targets for InfoLoss.
+
+        Args:
+            trajectory: list of L tensors, each [B, D_l], L2-normalized
+            idx_a, idx_b: [N_pairs] pair indices
+
+        Returns:
+            list of L tensors, each [N_pairs, D_l]
+        """
+        return [h[idx_a] * h[idx_b] for h in trajectory]
 
     # ------------------------------------------------------------------ #
     # Training loop
@@ -186,7 +216,7 @@ class Phase1Trainer:
 
     def _train_epoch(self, epoch: int, log_interval: int) -> dict:
         self.meta_encoder.train()
-        self.regressor.train()
+        self.info_loss.train()
 
         total_loss = 0.0
         total_info = 0.0
@@ -202,13 +232,12 @@ class Phase1Trainer:
             # Forward through frozen backbone (no grad, already detached)
             trajectory = self.backbone(images)
 
-            # Compute ground-truth alignment profiles [B, B, L]
+            # Scalar profiles [B, B, L] for GeometryLoss
             profiles = self.compute_profiles(trajectory)
 
             # Forward through meta-encoder
             z_list = self.meta_encoder(trajectory)  # list of L tensors [B, d]
 
-            # --- L_info ---
             # Form all unique pairs using upper-triangle indices
             idx_a, idx_b = torch.triu_indices(B, B, offset=1, device=self.device)
 
@@ -216,10 +245,10 @@ class Phase1Trainer:
             z_pairs_a = [z_l[idx_a] for z_l in z_list]  # list of L x [N_pairs, d]
             z_pairs_b = [z_l[idx_b] for z_l in z_list]
 
-            # Gather true similarities for pairs: [N_pairs, L]
-            true_sims_pairs = profiles[idx_a, idx_b, :]  # [N_pairs, L]
-
-            info_loss = self.info_loss(z_pairs_a, z_pairs_b, true_sims_pairs)
+            # --- L_info ---
+            # Rich per-channel targets: list of L x [N_pairs, D_l]
+            rich_targets = self.compute_pair_rich_profiles(trajectory, idx_a, idx_b)
+            info_loss = self.info_loss(z_pairs_a, z_pairs_b, rich_targets)
 
             # --- L_geometry ---
             geometry_loss = self.geometry_loss(z_list, profiles)
@@ -229,7 +258,7 @@ class Phase1Trainer:
 
             loss.backward()
             nn.utils.clip_grad_norm_(
-                list(self.meta_encoder.parameters()) + list(self.regressor.parameters()),
+                list(self.meta_encoder.parameters()) + list(self.info_loss.parameters()),
                 max_norm=1.0,
             )
             self.optimizer.step()
@@ -256,12 +285,17 @@ class Phase1Trainer:
     @torch.no_grad()
     def _val_epoch(self) -> dict:
         self.meta_encoder.eval()
-        self.regressor.eval()
+        self.info_loss.eval()
 
-        all_predicted = []
-        all_true = []
-        per_layer_z_sims = []
-        per_layer_true_sims = []
+        # Accumulators for rich R² (per-layer predicted vs true rich profiles)
+        # To avoid OOM with large D_l, accumulate per-layer separately and
+        # compute R² per layer, then average.
+        L = len(self.backbone.layer_dims)
+        layer_pred: list[list] = [[] for _ in range(L)]
+        layer_true: list[list] = [[] for _ in range(L)]
+
+        per_layer_z_sims: list[list] = [[] for _ in range(L)]
+        per_layer_true_sims: list[list] = [[] for _ in range(L)]
 
         for images, labels in self.val_loader:
             images = images.to(self.device)
@@ -273,56 +307,44 @@ class Phase1Trainer:
             profiles = self.compute_profiles(trajectory)
             z_list = self.meta_encoder(trajectory)
 
-            # Profile reconstruction (for R^2)
             idx_a, idx_b = torch.triu_indices(B, B, offset=1, device=self.device)
             z_pairs_a = [z_l[idx_a] for z_l in z_list]
             z_pairs_b = [z_l[idx_b] for z_l in z_list]
-            true_sims = profiles[idx_a, idx_b, :]  # [N_pairs, L]
 
-            L = len(z_list)
-            batch_pred = []
+            # Rich profile reconstruction (Criterion 1)
+            rich_targets = self.compute_pair_rich_profiles(trajectory, idx_a, idx_b)
             for l in range(L):
                 z_product = z_pairs_a[l] * z_pairs_b[l]
-                pred_l = self.regressor(z_product)  # [N_pairs]
-                batch_pred.append(pred_l)
+                pred_l = self.info_loss.regressors[l](z_product).cpu()  # [N_pairs, D_l]
+                true_l = rich_targets[l].cpu()                          # [N_pairs, D_l]
+                layer_pred[l].append(pred_l)
+                layer_true[l].append(true_l)
 
-            predicted = torch.stack(batch_pred, dim=1)  # [N_pairs, L]
-            all_predicted.append(predicted.cpu())
-            all_true.append(true_sims.cpu())
-
-            # Geometric consistency (for Spearman rho)
+            # Geometric consistency (Criterion 2, Spearman rho on scalar profiles)
             for l in range(L):
-                z_sim_l = (z_list[l] @ z_list[l].t())  # [B, B]
+                z_sim_l = (z_list[l] @ z_list[l].t())
                 true_sim_l = profiles[:, :, l]
-                # Upper triangle only
-                z_flat = z_sim_l[idx_a, idx_b].cpu().numpy()
-                t_flat = true_sim_l[idx_a, idx_b].cpu().numpy()
-                per_layer_z_sims.append((l, z_flat))
-                per_layer_true_sims.append((l, t_flat))
+                per_layer_z_sims[l].append(z_sim_l[idx_a, idx_b].cpu())
+                per_layer_true_sims[l].append(true_sim_l[idx_a, idx_b].cpu())
 
-        # Compute R^2
-        all_predicted = torch.cat(all_predicted, dim=0)
-        all_true = torch.cat(all_true, dim=0)
-        ss_res = ((all_predicted - all_true) ** 2).sum().item()
-        ss_tot = ((all_true - all_true.mean()) ** 2).sum().item()
-        r2 = 1.0 - ss_res / max(ss_tot, 1e-8)
+        # Compute per-layer R² and aggregate
+        per_layer_r2 = []
+        for l in range(L):
+            pred = torch.cat(layer_pred[l], dim=0).numpy()  # [N_total, D_l]
+            true = torch.cat(layer_true[l], dim=0).numpy()
+            ss_res = ((pred - true) ** 2).sum()
+            ss_tot = ((true - true.mean()) ** 2).sum()
+            r2_l = 1.0 - ss_res / max(ss_tot, 1e-8)
+            per_layer_r2.append(float(r2_l))
+        r2 = float(np.mean(per_layer_r2))
 
         # Compute per-layer Spearman rho
-        from collections import defaultdict
-        import numpy as np
-        layer_z = defaultdict(list)
-        layer_t = defaultdict(list)
-        for l, z_flat in per_layer_z_sims:
-            layer_z[l].append(z_flat)
-        for l, t_flat in per_layer_true_sims:
-            layer_t[l].append(t_flat)
-
         per_layer_rho = []
-        for l in sorted(layer_z.keys()):
-            z_all = np.concatenate(layer_z[l])
-            t_all = np.concatenate(layer_t[l])
+        for l in range(L):
+            z_all = torch.cat(per_layer_z_sims[l]).numpy()
+            t_all = torch.cat(per_layer_true_sims[l]).numpy()
             rho, _ = spearmanr(z_all, t_all)
-            per_layer_rho.append(rho if not np.isnan(rho) else 0.0)
+            per_layer_rho.append(float(rho) if not np.isnan(rho) else 0.0)
 
         mean_rho = float(np.mean(per_layer_rho)) if per_layer_rho else 0.0
 
@@ -343,7 +365,7 @@ class Phase1Trainer:
                 "epoch": epoch,
                 "val_metrics": val_metrics,
                 "meta_encoder_state": self.meta_encoder.state_dict(),
-                "regressor_state": self.regressor.state_dict(),
+                "info_loss_state": self.info_loss.state_dict(),
                 "optimizer_state": self.optimizer.state_dict(),
                 "config": self.cfg,
             },
@@ -353,7 +375,7 @@ class Phase1Trainer:
     def _load_checkpoint(self, path: str) -> int:
         ckpt = torch.load(path, map_location=self.device, weights_only=False)
         self.meta_encoder.load_state_dict(ckpt["meta_encoder_state"])
-        self.regressor.load_state_dict(ckpt["regressor_state"])
+        self.info_loss.load_state_dict(ckpt["info_loss_state"])
         self.optimizer.load_state_dict(ckpt["optimizer_state"])
         metrics = ckpt.get("val_metrics", {})
         print(

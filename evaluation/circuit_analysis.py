@@ -144,14 +144,16 @@ class CircuitAnalyzer:
         idx_b: torch.Tensor,
     ) -> torch.Tensor:
         """
-        Compute alignment profiles for specific pairs.
+        Compute scalar alignment profiles for specific pairs.
+        Used by SpanCentricDiscovery and geometric consistency evaluation.
 
         Args:
             trajectories: list of L tensors, each [N, D_l], L2-normalized
             idx_a, idx_b: [N_pairs] indices into trajectories
 
         Returns:
-            [N_pairs, L] per-layer cosine similarities
+            [N_pairs, L] per-layer cosine similarities (dot product of
+            L2-normalized flattened activations)
         """
         L = len(trajectories)
         N_pairs = idx_a.shape[0]
@@ -163,6 +165,26 @@ class CircuitAnalyzer:
             profiles[:, l] = (h_a * h_b).sum(dim=-1)
 
         return profiles
+
+    @staticmethod
+    def compute_pair_rich_profiles(
+        trajectories: list[torch.Tensor],
+        idx_a: torch.Tensor,
+        idx_b: torch.Tensor,
+    ) -> list[torch.Tensor]:
+        """
+        Compute rich per-channel co-activation vectors for specific pairs.
+        Used as InfoLoss targets and for Criterion 1 evaluation.
+
+        Args:
+            trajectories: list of L tensors, each [N, D_l], L2-normalized
+            idx_a, idx_b: [N_pairs] indices into trajectories
+
+        Returns:
+            list of L tensors, each [N_pairs, D_l]
+        """
+        return [trajectories[l][idx_a] * trajectories[l][idx_b]
+                for l in range(len(trajectories))]
 
     @staticmethod
     def compute_class_purity(

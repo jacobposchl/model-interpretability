@@ -20,7 +20,7 @@ def profile_reconstruction_r2(
     predicted: np.ndarray, true: np.ndarray
 ) -> dict:
     """
-    Criterion 1: Profile Reconstruction Accuracy.
+    Criterion 1: Profile Reconstruction Accuracy (scalar profile variant).
 
     Args:
         predicted: [N_pairs, L] predicted per-layer similarities
@@ -33,6 +33,48 @@ def profile_reconstruction_r2(
     ss_tot = np.sum((true - true.mean()) ** 2)
     r2 = 1.0 - ss_res / max(ss_tot, 1e-8)
     return {"r2": float(r2), "passes": r2 >= 0.7}
+
+
+def rich_profile_reconstruction_r2(
+    predicted_list: list, true_list: list
+) -> dict:
+    """
+    Criterion 1: Profile Reconstruction Accuracy (rich per-channel variant).
+
+    Evaluates reconstruction over the full per-channel co-activation vectors.
+    Reports both mean per-layer R² and an overall R² across all channels.
+
+    Args:
+        predicted_list: list of L arrays, each [N_pairs, D_l] — regressor outputs
+        true_list:      list of L arrays, each [N_pairs, D_l] — ground-truth
+                        rich profiles (norm(h_l^a) ⊙ norm(h_l^b))
+
+    Returns:
+        dict with:
+          'r2'           — overall R² across all layers and channels (primary metric)
+          'per_layer_r2' — list of per-layer R² scores
+          'passes'       — bool, overall R² >= 0.7
+    """
+    per_layer_r2 = []
+    total_ss_res = 0.0
+    total_ss_tot = 0.0
+
+    for pred, true in zip(predicted_list, true_list):
+        pred = np.asarray(pred)
+        true = np.asarray(true)
+        ss_res = np.sum((pred - true) ** 2)
+        ss_tot = np.sum((true - true.mean()) ** 2)
+        r2_l = 1.0 - ss_res / max(ss_tot, 1e-8)
+        per_layer_r2.append(float(r2_l))
+        total_ss_res += ss_res
+        total_ss_tot += ss_tot
+
+    r2 = 1.0 - total_ss_res / max(total_ss_tot, 1e-8)
+    return {
+        "r2": float(r2),
+        "per_layer_r2": per_layer_r2,
+        "passes": r2 >= 0.7,
+    }
 
 
 def geometric_consistency(

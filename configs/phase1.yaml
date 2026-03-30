@@ -5,7 +5,6 @@ model:
   arch: resnet18
   num_classes: 10
   pretrained: true
-  pool_mode: gap       # gap | max | topk
 
   meta_encoder:
     projection_dim: 128
