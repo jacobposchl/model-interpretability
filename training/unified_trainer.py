@@ -7,16 +7,18 @@ backbone's activation trajectories. The backbone is never modified.
     L_total = L_info + lambda * L_geometry
 
 where:
-  L_info:     Rich profile reconstruction fidelity (MLP_l on z_l^a * z_l^b vs
-              norm(h_l^a) ⊙ norm(h_l^b), the per-channel co-activation vector)
-  L_geometry: Soft contrastive geometry (profile-weighted cross-entropy in z-space)
+  L_info:     Flow co-activation reconstruction fidelity.
+              MLP_l(z_l^a * z_l^b)  vs  f_l^a ⊙ f_l^b
+              f_l(x) = compressed, L2-normalised bn2/bn3 output (pre-skip),
+              isolating the pure block contribution from accumulated history.
+  L_geometry: Soft contrastive geometry (flow-similarity-weighted cross-entropy
+              in z-space).  Scalar targets are cosine similarities of f_l vectors.
 
-All pairs are formed within-batch from standard CIFAR-10 batches. No class-label
-pairing is needed — the training signal comes entirely from alignment profiles.
+All pairs are formed within-batch.  No class-label pairing needed — the
+training signal comes entirely from flow co-activation profiles.
 """
 from __future__ import annotations
 
-from collections import defaultdict
 from pathlib import Path
 
 import numpy as np
@@ -41,7 +43,7 @@ class Phase1Trainer:
 
         self._build_models()
         self._build_data()
-        self._build_losses()      # must come before _build_optimizers (optimizer needs info_loss params)
+        self._build_losses()      # must come before _build_optimizers
         self._build_optimizers()
         self._build_schedulers()
 
@@ -54,16 +56,19 @@ class Phase1Trainer:
 
     def _build_models(self):
         mcfg = self.cfg["model"]
+        fcfg = mcfg.get("flow_compression", {})
 
         self.backbone = FrozenBackbone(
             arch=mcfg["arch"],
             num_classes=mcfg.get("num_classes", 10),
             pretrained=mcfg.get("pretrained", True),
+            grid_size=fcfg.get("grid_size", 4),
+            flow_dim=fcfg.get("flow_dim", 256),
         ).to(self.device)
 
         ecfg = mcfg["meta_encoder"]
         self.meta_encoder = MetaEncoder(
-            layer_dims=self.backbone.layer_dims,
+            layer_dims=self.backbone.layer_dims,   # [D_flow] * L
             projection_dim=ecfg.get("projection_dim", 128),
             n_heads=ecfg.get("n_heads", 4),
             n_transformer_layers=ecfg.get("n_transformer_layers", 2),
@@ -83,7 +88,6 @@ class Phase1Trainer:
     def _build_optimizers(self):
         tcfg = self.cfg["training"]
         lr = float(tcfg.get("lr", 1e-3))
-        # Only meta-encoder and info_loss regressors are trained; backbone is frozen
         params = (
             list(self.meta_encoder.parameters())
             + list(self.info_loss.parameters())
@@ -106,7 +110,7 @@ class Phase1Trainer:
         rcfg = mcfg.get("regressor", {})
 
         self.info_loss = InfoLoss(
-            layer_dims=self.backbone.layer_dims,
+            layer_dims=self.backbone.layer_dims,   # [D_flow] * L
             projection_dim=ecfg.get("projection_dim", 128),
             hidden_dim=rcfg.get("hidden_dim", 64),
         ).to(self.device)
@@ -127,54 +131,6 @@ class Phase1Trainer:
         self.lambda_val = self.lambda_scheduler.get(0)
 
     # ------------------------------------------------------------------ #
-    # Profile computation
-    # ------------------------------------------------------------------ #
-
-    @staticmethod
-    def compute_profiles(trajectory: list[torch.Tensor]) -> torch.Tensor:
-        """
-        Compute pairwise scalar alignment profiles from L2-normalized trajectory.
-        Used by GeometryLoss (which needs [B, B, L] scalar similarities) and
-        validation Spearman correlation.
-
-        Args:
-            trajectory: list of L tensors, each [B, D_l], L2-normalized
-
-        Returns:
-            profiles: [B, B, L] pairwise per-layer cosine similarities
-                      (= mean of per-channel co-activation, scaled by D_l)
-        """
-        L = len(trajectory)
-        B = trajectory[0].shape[0]
-        device = trajectory[0].device
-
-        profiles = torch.empty(B, B, L, device=device)
-        for l in range(L):
-            # h_l is L2-normalized; dot product = cosine similarity
-            profiles[:, :, l] = trajectory[l] @ trajectory[l].t()
-
-        return profiles
-
-    @staticmethod
-    def compute_pair_rich_profiles(
-        trajectory: list[torch.Tensor],
-        idx_a: torch.Tensor,
-        idx_b: torch.Tensor,
-    ) -> list[torch.Tensor]:
-        """
-        Compute rich per-channel co-activation vectors for specific pairs.
-        Used as targets for InfoLoss.
-
-        Args:
-            trajectory: list of L tensors, each [B, D_l], L2-normalized
-            idx_a, idx_b: [N_pairs] pair indices
-
-        Returns:
-            list of L tensors, each [N_pairs, D_l]
-        """
-        return [h[idx_a] * h[idx_b] for h in trajectory]
-
-    # ------------------------------------------------------------------ #
     # Training loop
     # ------------------------------------------------------------------ #
 
@@ -185,15 +141,15 @@ class Phase1Trainer:
         if resume_from is not None:
             start_epoch = self._load_checkpoint(resume_from)
 
-        epochs = self.cfg["training"]["epochs"]
+        epochs       = self.cfg["training"]["epochs"]
         log_interval = self.cfg["logging"].get("log_interval", 50)
-        save_every = self.cfg["logging"].get("save_every", 10)
+        save_every   = self.cfg["logging"].get("save_every", 10)
 
         for epoch in range(start_epoch, epochs):
             self.lambda_val = self.lambda_scheduler.get(epoch)
 
             train_metrics = self._train_epoch(epoch, log_interval)
-            val_metrics = self._val_epoch()
+            val_metrics   = self._val_epoch()
             self.lr_scheduler.step()
 
             print(
@@ -221,7 +177,7 @@ class Phase1Trainer:
         total_loss = 0.0
         total_info = 0.0
         total_geom = 0.0
-        n_batches = 0
+        n_batches  = 0
 
         for batch_idx, (images, labels) in enumerate(self.train_loader):
             self.optimizer.zero_grad()
@@ -229,26 +185,33 @@ class Phase1Trainer:
             images = images.to(self.device)
             B = images.shape[0]
 
-            # Forward through frozen backbone (no grad, already detached)
-            trajectory = self.backbone(images)
+            # One backbone forward populates both _trajectory and _flow_targets
+            trajectory   = self.backbone(images)
+            flow_targets = self.backbone._flow_targets   # list of L x [B, D_flow]
+            L = len(trajectory)
 
-            # Scalar profiles [B, B, L] for GeometryLoss
-            profiles = self.compute_profiles(trajectory)
+            # [B, B, L] scalar similarity matrix for GeometryLoss
+            # f_l is L2-normalised so dot product = cosine similarity
+            profiles = torch.stack(
+                [flow_targets[l] @ flow_targets[l].t() for l in range(L)],
+                dim=-1,
+            )  # [B, B, L]
 
-            # Forward through meta-encoder
-            z_list = self.meta_encoder(trajectory)  # list of L tensors [B, d]
+            # Meta-encoder forward
+            z_list = self.meta_encoder(trajectory)   # list of L x [B, d]
 
-            # Form all unique pairs using upper-triangle indices
+            # All unique pairs
             idx_a, idx_b = torch.triu_indices(B, B, offset=1, device=self.device)
 
-            # Gather per-layer z-vectors for each pair
-            z_pairs_a = [z_l[idx_a] for z_l in z_list]  # list of L x [N_pairs, d]
+            z_pairs_a = [z_l[idx_a] for z_l in z_list]
             z_pairs_b = [z_l[idx_b] for z_l in z_list]
 
-            # --- L_info ---
-            # Rich per-channel targets: list of L x [N_pairs, D_l]
-            rich_targets = self.compute_pair_rich_profiles(trajectory, idx_a, idx_b)
-            info_loss = self.info_loss(z_pairs_a, z_pairs_b, rich_targets)
+            # --- L_info --- flow co-activation targets: f_l^a ⊙ f_l^b
+            flow_coact = [
+                flow_targets[l][idx_a] * flow_targets[l][idx_b]
+                for l in range(L)
+            ]   # list of L x [N_pairs, D_flow]
+            info_loss = self.info_loss(z_pairs_a, z_pairs_b, flow_coact)
 
             # --- L_geometry ---
             geometry_loss = self.geometry_loss(z_list, profiles)
@@ -266,7 +229,7 @@ class Phase1Trainer:
             total_loss += loss.item()
             total_info += info_loss.item()
             total_geom += geometry_loss.item()
-            n_batches += 1
+            n_batches  += 1
 
             if (batch_idx + 1) % log_interval == 0:
                 print(
@@ -277,8 +240,8 @@ class Phase1Trainer:
                 )
 
         return {
-            "loss": total_loss / max(n_batches, 1),
-            "info_loss": total_info / max(n_batches, 1),
+            "loss":          total_loss / max(n_batches, 1),
+            "info_loss":     total_info / max(n_batches, 1),
             "geometry_loss": total_geom / max(n_batches, 1),
         }
 
@@ -287,15 +250,11 @@ class Phase1Trainer:
         self.meta_encoder.eval()
         self.info_loss.eval()
 
-        # Accumulators for rich R² (per-layer predicted vs true rich profiles)
-        # To avoid OOM with large D_l, accumulate per-layer separately and
-        # compute R² per layer, then average.
         L = len(self.backbone.layer_dims)
-        layer_pred: list[list] = [[] for _ in range(L)]
-        layer_true: list[list] = [[] for _ in range(L)]
-
-        per_layer_z_sims: list[list] = [[] for _ in range(L)]
-        per_layer_true_sims: list[list] = [[] for _ in range(L)]
+        layer_pred:          list[list] = [[] for _ in range(L)]
+        layer_true:          list[list] = [[] for _ in range(L)]
+        per_layer_z_sims:    list[list] = [[] for _ in range(L)]
+        per_layer_flow_sims: list[list] = [[] for _ in range(L)]
 
         for images, labels in self.val_loader:
             images = images.to(self.device)
@@ -303,54 +262,52 @@ class Phase1Trainer:
             if B < 2:
                 continue
 
-            trajectory = self.backbone(images)
-            profiles = self.compute_profiles(trajectory)
-            z_list = self.meta_encoder(trajectory)
+            trajectory   = self.backbone(images)
+            flow_targets = self.backbone._flow_targets   # list of L x [B, D_flow]
+            z_list       = self.meta_encoder(trajectory)
 
             idx_a, idx_b = torch.triu_indices(B, B, offset=1, device=self.device)
             z_pairs_a = [z_l[idx_a] for z_l in z_list]
             z_pairs_b = [z_l[idx_b] for z_l in z_list]
 
-            # Rich profile reconstruction (Criterion 1)
-            rich_targets = self.compute_pair_rich_profiles(trajectory, idx_a, idx_b)
+            # Criterion 1: flow co-activation reconstruction R²
             for l in range(L):
                 z_product = z_pairs_a[l] * z_pairs_b[l]
-                pred_l = self.info_loss.regressors[l](z_product).cpu()  # [N_pairs, D_l]
-                true_l = rich_targets[l].cpu()                          # [N_pairs, D_l]
+                pred_l = self.info_loss.regressors[l](z_product).cpu()   # [N, D_flow]
+                true_l = (flow_targets[l][idx_a] * flow_targets[l][idx_b]).cpu()
                 layer_pred[l].append(pred_l)
                 layer_true[l].append(true_l)
 
-            # Geometric consistency (Criterion 2, Spearman rho on scalar profiles)
+            # Criterion 2: geometric consistency (Spearman rho)
             for l in range(L):
-                z_sim_l = (z_list[l] @ z_list[l].t())
-                true_sim_l = profiles[:, :, l]
+                z_sim_l    = (z_list[l] @ z_list[l].t())
+                flow_sim_l = (flow_targets[l] @ flow_targets[l].t())
                 per_layer_z_sims[l].append(z_sim_l[idx_a, idx_b].cpu())
-                per_layer_true_sims[l].append(true_sim_l[idx_a, idx_b].cpu())
+                per_layer_flow_sims[l].append(flow_sim_l[idx_a, idx_b].cpu())
 
-        # Compute per-layer R² and aggregate
+        # Per-layer R²
         per_layer_r2 = []
         for l in range(L):
-            pred = torch.cat(layer_pred[l], dim=0).numpy()  # [N_total, D_l]
+            pred = torch.cat(layer_pred[l], dim=0).numpy()
             true = torch.cat(layer_true[l], dim=0).numpy()
             ss_res = ((pred - true) ** 2).sum()
             ss_tot = ((true - true.mean()) ** 2).sum()
-            r2_l = 1.0 - ss_res / max(ss_tot, 1e-8)
-            per_layer_r2.append(float(r2_l))
+            per_layer_r2.append(float(1.0 - ss_res / max(ss_tot, 1e-8)))
         r2 = float(np.mean(per_layer_r2))
 
-        # Compute per-layer Spearman rho
+        # Per-layer Spearman rho
         per_layer_rho = []
         for l in range(L):
-            z_all = torch.cat(per_layer_z_sims[l]).numpy()
-            t_all = torch.cat(per_layer_true_sims[l]).numpy()
-            rho, _ = spearmanr(z_all, t_all)
+            z_all    = torch.cat(per_layer_z_sims[l]).numpy()
+            flow_all = torch.cat(per_layer_flow_sims[l]).numpy()
+            rho, _   = spearmanr(z_all, flow_all)
             per_layer_rho.append(float(rho) if not np.isnan(rho) else 0.0)
 
         mean_rho = float(np.mean(per_layer_rho)) if per_layer_rho else 0.0
 
         return {
-            "r2": r2,
-            "mean_rho": mean_rho,
+            "r2":           r2,
+            "mean_rho":     mean_rho,
             "per_layer_rho": per_layer_rho,
         }
 
@@ -362,12 +319,12 @@ class Phase1Trainer:
         path = self.checkpoint_dir / name
         torch.save(
             {
-                "epoch": epoch,
-                "val_metrics": val_metrics,
-                "meta_encoder_state": self.meta_encoder.state_dict(),
-                "info_loss_state": self.info_loss.state_dict(),
-                "optimizer_state": self.optimizer.state_dict(),
-                "config": self.cfg,
+                "epoch":               epoch,
+                "val_metrics":         val_metrics,
+                "meta_encoder_state":  self.meta_encoder.state_dict(),
+                "info_loss_state":     self.info_loss.state_dict(),
+                "optimizer_state":     self.optimizer.state_dict(),
+                "config":              self.cfg,
             },
             path,
         )

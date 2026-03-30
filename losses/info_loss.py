@@ -1,19 +1,20 @@
 """
-Fidelity loss L_info: trains per-layer z-representations to encode the rich
-per-channel co-activation structure of the backbone's alignment profiles.
+Fidelity loss L_info: trains per-layer z-representations to encode the flow
+co-activation structure of each backbone block.
 
-L_info = (1/L) * sum_l || MLP_l(z_l^a * z_l^b) - (norm(h_l^a) ⊙ norm(h_l^b)) ||^2
+L_info = (1/L) * sum_l || MLP_l(z_l^a * z_l^b) - (f_l^a ⊙ f_l^b) ||^2
 
-The target is the per-channel co-activation vector at each layer — the element-
-wise product of the two L2-normalized (flattened, un-pooled) activations. This
-strictly generalises the old scalar cosine similarity: summing over channels
-recovers the original dot product, but the per-channel vector preserves which
-channels the two inputs co-activate, not just how much.
+The target f_l^a ⊙ f_l^b is the element-wise product of the two compressed,
+L2-normalized flow vectors at layer l.  f_l(x) is derived from the non-skip
+branch output F_l(x) = bn2(x) (pre-residual addition), compressed via
+AdaptiveMaxPool2d + Flatten + a fixed linear projection to D_flow dimensions.
+This isolates each block's contribution from the accumulated residual history,
+making it the correct signal for circuit detection.
 
-Each layer has its own ProfileRegressor with output_dim = D_l (the flattened
-spatial dimension of that backbone layer), since D_l varies across layers.
-The element-wise product z_l^a * z_l^b is symmetric by construction, matching
-the symmetry of the rich profile target.
+With the flow compression, all layers share the same D_flow output dimension,
+so layer_dims = [D_flow] * L and the regressor architecture is uniform.
+The element-wise product z_l^a * z_l^b is symmetric, matching the symmetry
+of the co-activation target f_l^a ⊙ f_l^b.
 """
 from __future__ import annotations
 
@@ -41,9 +42,9 @@ class InfoLoss(nn.Module):
     ):
         """
         Args:
-            layer_dims:     List of flattened backbone dimensions per layer
-                            (D_l = C_l * H_l * W_l). One regressor is built
-                            per layer with output_dim = D_l.
+            layer_dims:     Per-layer flow dimensions (= [D_flow] * L with the
+                            flow-compression backbone).  One regressor per layer
+                            with output_dim = layer_dims[l].
             projection_dim: Input dimension to each regressor (= z vector dim d).
             hidden_dim:     Hidden dimension of each regressor MLP.
         """
@@ -67,8 +68,8 @@ class InfoLoss(nn.Module):
         Args:
             z_list_a:     list of L tensors, each [N_pairs, d]
             z_list_b:     list of L tensors, each [N_pairs, d]
-            rich_targets: list of L tensors, each [N_pairs, D_l] — the per-channel
-                          co-activation vectors (norm(h_l^a) ⊙ norm(h_l^b))
+            rich_targets: list of L tensors, each [N_pairs, D_flow] — the flow
+                          co-activation vectors (f_l^a ⊙ f_l^b)
 
         Returns:
             Scalar loss (mean MSE over layers).

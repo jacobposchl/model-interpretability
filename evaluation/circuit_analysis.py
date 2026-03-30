@@ -2,7 +2,7 @@
 Circuit analysis utilities for Phase 1 meta-encoder validation.
 
 Handles data collection from the frozen backbone + meta-encoder, pairwise
-alignment profile computation, and class purity analysis for discovered
+flow similarity profile computation, and class purity analysis for discovered
 circuit clusters.
 """
 from __future__ import annotations
@@ -36,7 +36,7 @@ def denormalize(x: torch.Tensor) -> torch.Tensor:
 class CircuitAnalyzer:
     """
     Collects representations from the frozen backbone + trained meta-encoder
-    and computes alignment profiles for downstream circuit discovery.
+    and computes flow-based alignment profiles for downstream circuit discovery.
     """
 
     def __init__(
@@ -46,26 +46,31 @@ class CircuitAnalyzer:
         loader: DataLoader,
         device: torch.device,
     ):
-        self.backbone = backbone
+        self.backbone     = backbone
         self.meta_encoder = meta_encoder
-        self.loader = loader
-        self.device = device
+        self.loader       = loader
+        self.device       = device
 
     @torch.no_grad()
     def collect_representations(self, max_samples: int = 10000) -> dict:
         """
-        Collect trajectories, per-layer z-vectors, images, and labels.
+        Collect trajectories, flow targets, per-layer z-vectors, images, labels.
 
         Returns dict with:
-            trajectories: list of L tensors, each [N, D_l] (CPU)
+            trajectories: list of L tensors, each [N, D_flow] — compressed block
+                          outputs (post-relu, post-skip), L2-normalised (CPU)
+            flow_targets: list of L tensors, each [N, D_flow] — compressed bn2/bn3
+                          outputs (pre-skip), L2-normalised (CPU).  Use these for
+                          scalar profiles, co-activation targets, and discovery.
             z_list:       list of L tensors, each [N, d] (CPU)
             labels:       [N] integer class labels (CPU)
-            images:       [N, 3, 32, 32] normalized images (CPU)
+            images:       [N, 3, 32, 32] normalised images (CPU)
         """
         self.meta_encoder.eval()
 
-        all_trajs: list[list] | None = None
-        all_z: list[list] | None = None
+        all_trajs:  list[list] | None = None
+        all_flows:  list[list] | None = None
+        all_z:      list[list] | None = None
         all_labels = []
         all_images = []
         n = 0
@@ -74,15 +79,19 @@ class CircuitAnalyzer:
             images = batch[0].to(self.device)
             labels = batch[-1]
 
-            trajectory = self.backbone(images)
-            z_list = self.meta_encoder(trajectory)
+            trajectory   = self.backbone(images)
+            flow_targets = self.backbone._flow_targets
+            z_list       = self.meta_encoder(trajectory)
 
             if all_trajs is None:
                 all_trajs = [[] for _ in range(len(trajectory))]
-                all_z = [[] for _ in range(len(z_list))]
+                all_flows = [[] for _ in range(len(flow_targets))]
+                all_z     = [[] for _ in range(len(z_list))]
 
             for l, h in enumerate(trajectory):
                 all_trajs[l].append(h.cpu())
+            for l, f in enumerate(flow_targets):
+                all_flows[l].append(f.cpu())
             for l, z in enumerate(z_list):
                 all_z[l].append(z.cpu())
 
@@ -93,98 +102,96 @@ class CircuitAnalyzer:
             if n >= max_samples:
                 break
 
-        L = len(all_trajs)
+        L            = len(all_trajs)
         trajectories = [torch.cat(all_trajs[l], 0)[:max_samples] for l in range(L)]
-        z_list = [torch.cat(all_z[l], 0)[:max_samples] for l in range(L)]
-        labels = torch.cat(all_labels, 0)[:max_samples]
-        images = torch.cat(all_images, 0)[:max_samples]
+        flow_targets = [torch.cat(all_flows[l],  0)[:max_samples] for l in range(L)]
+        z_list       = [torch.cat(all_z[l],      0)[:max_samples] for l in range(L)]
+        labels       = torch.cat(all_labels, 0)[:max_samples]
+        images       = torch.cat(all_images, 0)[:max_samples]
 
         return {
             "trajectories": trajectories,
-            "z_list": z_list,
-            "labels": labels,
-            "images": images,
+            "flow_targets": flow_targets,
+            "z_list":       z_list,
+            "labels":       labels,
+            "images":       images,
         }
 
     @staticmethod
     def compute_all_profiles(
-        trajectories: list[torch.Tensor],
+        flow_targets: list[torch.Tensor],
         chunk_size: int = 1000,
     ) -> torch.Tensor:
         """
-        Compute pairwise alignment profiles from L2-normalized trajectories.
-
-        For large N, computes in chunks to avoid OOM.
+        Compute full [N, N, L] pairwise flow cosine similarity matrix.
 
         Args:
-            trajectories: list of L tensors, each [N, D_l], L2-normalized
-            chunk_size:   max rows to process at once
+            flow_targets: list of L tensors, each [N, D_flow], L2-normalised
+            chunk_size:   max rows per chunk to keep memory bounded
 
         Returns:
-            [N, N, L] pairwise per-layer cosine similarities
+            [N, N, L] pairwise per-layer flow cosine similarities
         """
-        L = len(trajectories)
-        N = trajectories[0].shape[0]
+        L = len(flow_targets)
+        N = flow_targets[0].shape[0]
 
         profiles = torch.zeros(N, N, L)
 
         for l in range(L):
-            h = trajectories[l]  # [N, D_l]
-            # Compute full pairwise similarity in chunks
+            f = flow_targets[l]   # [N, D_flow]
             for i in range(0, N, chunk_size):
                 end = min(i + chunk_size, N)
-                profiles[i:end, :, l] = h[i:end] @ h.t()
+                profiles[i:end, :, l] = f[i:end] @ f.t()
 
         return profiles
 
     @staticmethod
     def compute_pair_profiles(
-        trajectories: list[torch.Tensor],
+        flow_targets: list[torch.Tensor],
         idx_a: torch.Tensor,
         idx_b: torch.Tensor,
     ) -> torch.Tensor:
         """
-        Compute scalar alignment profiles for specific pairs.
+        Compute scalar flow cosine similarities for specific pairs.
         Used by SpanCentricDiscovery and geometric consistency evaluation.
 
         Args:
-            trajectories: list of L tensors, each [N, D_l], L2-normalized
-            idx_a, idx_b: [N_pairs] indices into trajectories
+            flow_targets: list of L tensors, each [N, D_flow], L2-normalised
+            idx_a, idx_b: [N_pairs] indices
 
         Returns:
-            [N_pairs, L] per-layer cosine similarities (dot product of
-            L2-normalized flattened activations)
+            [N_pairs, L] per-layer flow cosine similarities
         """
-        L = len(trajectories)
+        L       = len(flow_targets)
         N_pairs = idx_a.shape[0]
         profiles = torch.zeros(N_pairs, L)
 
         for l in range(L):
-            h_a = trajectories[l][idx_a]  # [N_pairs, D_l]
-            h_b = trajectories[l][idx_b]
-            profiles[:, l] = (h_a * h_b).sum(dim=-1)
+            f_a = flow_targets[l][idx_a]   # [N_pairs, D_flow]
+            f_b = flow_targets[l][idx_b]
+            profiles[:, l] = (f_a * f_b).sum(dim=-1)
 
         return profiles
 
     @staticmethod
     def compute_pair_rich_profiles(
-        trajectories: list[torch.Tensor],
+        flow_targets: list[torch.Tensor],
         idx_a: torch.Tensor,
         idx_b: torch.Tensor,
     ) -> list[torch.Tensor]:
         """
-        Compute rich per-channel co-activation vectors for specific pairs.
+        Compute flow co-activation vectors for specific pairs.
         Used as InfoLoss targets and for Criterion 1 evaluation.
 
         Args:
-            trajectories: list of L tensors, each [N, D_l], L2-normalized
-            idx_a, idx_b: [N_pairs] indices into trajectories
+            flow_targets: list of L tensors, each [N, D_flow], L2-normalised
+            idx_a, idx_b: [N_pairs] indices
 
         Returns:
-            list of L tensors, each [N_pairs, D_l]
+            list of L tensors, each [N_pairs, D_flow]
         """
-        return [trajectories[l][idx_a] * trajectories[l][idx_b]
-                for l in range(len(trajectories))]
+        return [flow_targets[l][idx_a] * flow_targets[l][idx_b]
+                for l in range(len(flow_targets))]
 
     @staticmethod
     def compute_class_purity(
@@ -203,9 +210,9 @@ class CircuitAnalyzer:
         Returns:
             Purity score in [0, 1]
         """
-        selected = pair_indices[mask]
+        selected     = pair_indices[mask]
         unique_inputs = selected.unique()
-        input_labels = labels[unique_inputs]
+        input_labels  = labels[unique_inputs]
 
         if len(input_labels) == 0:
             return 0.0

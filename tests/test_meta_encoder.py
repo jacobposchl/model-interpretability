@@ -21,7 +21,7 @@ from models.meta_encoder import (
 # Shared helpers
 # --------------------------------------------------------------------------- #
 
-LAYER_DIMS = [64, 64, 128, 128, 256, 256, 512, 512]  # ResNet18
+LAYER_DIMS = [256] * 8   # D_flow = 256 for all layers (flow-compression backbone)
 
 
 def make_traj(B=4, layer_dims=LAYER_DIMS):
@@ -143,13 +143,20 @@ class TestMetaEncoder:
 
 class TestProfileRegressor:
     def test_output_shape(self):
-        reg = ProfileRegressor(input_dim=128, hidden_dim=64)
+        """output_dim controls the last dimension of the output tensor."""
+        reg = ProfileRegressor(input_dim=128, hidden_dim=64, output_dim=256)
         z_product = torch.randn(16, 128)
         out = reg(z_product)
-        assert out.shape == (16,)
+        assert out.shape == (16, 256)
+
+    def test_output_shape_small(self):
+        """Works with any output_dim including 1."""
+        reg = ProfileRegressor(input_dim=64, hidden_dim=32, output_dim=16)
+        out = reg(torch.randn(8, 64))
+        assert out.shape == (8, 16)
 
     def test_backprop(self):
-        reg = ProfileRegressor(input_dim=64, hidden_dim=32)
+        reg = ProfileRegressor(input_dim=64, hidden_dim=32, output_dim=256)
         z = torch.randn(8, 64, requires_grad=True)
         out = reg(z)
         out.sum().backward()
@@ -157,7 +164,7 @@ class TestProfileRegressor:
 
     def test_symmetric_input(self):
         """z_a * z_b should equal z_b * z_a, producing identical output."""
-        reg = ProfileRegressor(input_dim=64)
+        reg = ProfileRegressor(input_dim=64, hidden_dim=32, output_dim=256)
         z_a = torch.randn(4, 64)
         z_b = torch.randn(4, 64)
         out_ab = reg(z_a * z_b)

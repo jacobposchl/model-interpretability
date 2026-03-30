@@ -20,7 +20,7 @@ from losses.geometry_loss import GeometryLoss
 D = 64       # projection dim (z vector dim)
 L = 8        # layers
 B = 16       # batch size
-LAYER_DIMS = [16] * L  # small fixed D_l per layer for testing
+LAYER_DIMS = [16] * L  # small D_flow per layer for testing (prod uses 256)
 
 
 def make_z_list(B=B, L=L, d=D):
@@ -34,7 +34,7 @@ def make_z_list(B=B, L=L, d=D):
 
 
 def make_rich_targets(N_pairs=100, layer_dims=LAYER_DIMS):
-    """Random per-channel co-activation vectors for pairs (one per layer)."""
+    """Random flow co-activation vectors for pairs (one per layer)."""
     return [torch.rand(N_pairs, D_l) for D_l in layer_dims]
 
 

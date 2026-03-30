@@ -9,6 +9,10 @@ model:
   num_classes: 10
   pretrained: true
 
+  flow_compression:
+    grid_size: 4
+    flow_dim: 256
+
   meta_encoder:
     projection_dim: 128
     n_heads: 4
